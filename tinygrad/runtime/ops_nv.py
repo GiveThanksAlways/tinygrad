@@ -882,7 +882,7 @@ class TegraIface:
         gpfifo_buf_handle = params.hObjectBuffer
         userd_buf_offset = params.userdOffset[0]  # entries*8 + offset — dmabuf-relative
 
-      # Find the gpfifo_area's _TegraMem to get its dmabuf_fd and GPU VA
+      # Find the gpfifo_area's _TegraMem to get its cpu_addr for MAP_FIXED overlays
       gpfifo_area_mem = None
       for mem in self._allocs:
         if mem.hMemory == gpfifo_buf_handle:
@@ -891,11 +891,32 @@ class TegraIface:
       if gpfifo_area_mem is None:
         raise RuntimeError(f"TegraIface: can't find gpfifo_area alloc for handle {gpfifo_buf_handle}")
 
-      gpfifo_dmabuf_fd = gpfifo_area_mem.dmabuf_fd
-      gpfifo_dmabuf_offset = gpfifo_va - gpfifo_area_mem.gpu_va  # offset within dmabuf where GPFIFO ring starts
+      # CRITICAL: nvgpu kernel constraints (linux-channel.c):
+      #   1. gpfifo_dmabuf_offset MUST be 0 (non-zero returns -EINVAL)
+      #   2. userd_dmabuf_offset MUST be 0 (non-zero returns -EINVAL)
+      #   3. Kernel maps the ENTIRE dmabuf into GPU VA via nvgpu_gmmu_map
+      #      → Large dmabufs (3MB) fragment VA space and crash ALLOC_OBJ_CTX
+      # Solution: create per-channel SMALL dedicated nvmap buffers.
 
-      # nvgpu SETUP_BIND requires SEPARATE dmabuf fds for gpfifo and userd.
-      # Allocate a separate 4KB nvmap buffer for userd.
+      gpfifo_ring_size = gpfifo_entries * 8  # e.g., 1024 * 8 = 8KB
+      gpfifo_cpu_offset = gpfifo_va - gpfifo_area_mem.gpu_va  # offset within gpfifo_area for CPU addressing
+
+      # --- Allocate dedicated gpfifo ring buffer (exactly entries*8 bytes) ---
+      gcreate = _nvmap_create_handle()
+      gcreate.size = gpfifo_ring_size
+      _tegra_ioctl(self._nvmap_fd, _NVMAP_IOC_CREATE, gcreate)
+      galloc = _nvmap_alloc_handle()
+      galloc.handle = gcreate.handle
+      galloc.heap_mask = _NVMAP_HEAP_IOVMM
+      galloc.flags = _NVMAP_HANDLE_WRITE_COMBINE
+      galloc.align = 4096
+      _tegra_ioctl(self._nvmap_fd, _NVMAP_IOC_ALLOC, galloc)
+      ggetfd = _nvmap_create_handle()
+      ggetfd.handle = gcreate.handle
+      _tegra_ioctl(self._nvmap_fd, _NVMAP_IOC_GET_FD, ggetfd)
+      gpfifo_ring_dmabuf_fd = ggetfd.size  # dmabuf fd in .size field
+
+      # --- Allocate dedicated 4KB userd buffer ---
       USERD_SIZE = 4096
       ucreate = _nvmap_create_handle()
       ucreate.size = USERD_SIZE
@@ -911,31 +932,40 @@ class TegraIface:
       _tegra_ioctl(self._nvmap_fd, _NVMAP_IOC_GET_FD, ugetfd)
       userd_dmabuf_fd = ugetfd.size  # dmabuf fd in .size field
 
-      # SETUP_BIND with separate dmabuf fds
+      # SETUP_BIND with per-channel small buffers, both at offset 0
       setup = _nvgpu_channel_setup_bind_args()
       setup.num_gpfifo_entries = gpfifo_entries
       setup.num_inflight_jobs = 0
-      setup.gpfifo_dmabuf_fd = gpfifo_dmabuf_fd
-      setup.gpfifo_dmabuf_offset = gpfifo_dmabuf_offset
-      setup.userd_dmabuf_fd = userd_dmabuf_fd
-      setup.userd_dmabuf_offset = 0
+      setup.gpfifo_dmabuf_fd = gpfifo_ring_dmabuf_fd  # dedicated small buffer (NOT gpfifo_area)
+      setup.gpfifo_dmabuf_offset = 0                  # MUST be 0 per kernel constraint
+      setup.userd_dmabuf_fd = userd_dmabuf_fd          # dedicated 4KB buffer
+      setup.userd_dmabuf_offset = 0                    # MUST be 0 per kernel constraint
       setup.flags = _NVGPU_SETUP_BIND_FLAGS_USERMODE_SUPPORT | _NVGPU_SETUP_BIND_FLAGS_DETERMINISTIC
 
       if getenv("DEBUG", 0) >= 1:
-        print(f"TegraIface SETUP_BIND: ch_fd={ch_fd} entries={setup.num_gpfifo_entries} "
-              f"gpfifo_dmabuf_fd={gpfifo_dmabuf_fd} gpfifo_off={setup.gpfifo_dmabuf_offset} "
-              f"userd_dmabuf_fd={userd_dmabuf_fd} userd_off=0 flags=0x{setup.flags:x}")
+        print(f"TegraIface SETUP_BIND: ch_fd={ch_fd} entries={gpfifo_entries} ring_size={gpfifo_ring_size} "
+              f"gpfifo_dmabuf_fd={gpfifo_ring_dmabuf_fd} userd_dmabuf_fd={userd_dmabuf_fd} flags=0x{setup.flags:x}")
 
       _tegra_ioctl(ch_fd, _NVGPU_IOCTL_CHANNEL_SETUP_BIND, setup)
 
-      # Now mmap the userd dmabuf over the userd region in gpfifo_area's CPU mapping.
-      # tinygrad reads/writes GPPut/GPGet at: gpfifo_area_cpu_base + userd_buf_offset
-      # We overlay the userd dmabuf there so GPU and CPU share the same physical page.
+      # MAP_FIXED overlay: replace gpfifo_area's pages with per-channel dmabuf pages.
+      # This lets tinygrad's cpu_view() work unchanged — it reads from gpfifo_area's mmap,
+      # but the physical backing is now the small per-channel dmabufs that the GPU also sees.
       import ctypes as ct
       libc_so = ct.CDLL("libc.so.6", use_errno=True)
       libc_so.mmap.restype = ct.c_void_p
       libc_so.mmap.argtypes = [ct.c_void_p, ct.c_size_t, ct.c_int, ct.c_int, ct.c_int, ct.c_long]
 
+      # Overlay gpfifo ring at gpfifo_area_cpu + offset
+      gpfifo_cpu_target = gpfifo_area_mem.cpu_addr + gpfifo_cpu_offset
+      ring_addr = libc_so.mmap(ct.c_void_p(gpfifo_cpu_target), gpfifo_ring_size,
+                               mmap.PROT_READ | mmap.PROT_WRITE,
+                               mmap.MAP_SHARED | MAP_FIXED,
+                               gpfifo_ring_dmabuf_fd, 0)
+      if ring_addr is None or ring_addr == ct.c_void_p(-1).value or ring_addr == 0xffffffffffffffff:
+        raise RuntimeError(f"TegraIface: gpfifo ring overlay mmap failed (errno={ct.get_errno()})")
+
+      # Overlay userd at gpfifo_area_cpu + userd_buf_offset
       userd_cpu_target = gpfifo_area_mem.cpu_addr + userd_buf_offset
       overlay_addr = libc_so.mmap(ct.c_void_p(userd_cpu_target), USERD_SIZE,
                                   mmap.PROT_READ | mmap.PROT_WRITE,
@@ -1225,14 +1255,22 @@ class NVDevice(HCQCompiled[NVSignal]):
     channel_params = nv_gpu.NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS(engineType=nv_gpu.NV2080_ENGINE_TYPE_GRAPHICS)
     self.channel_group = self.iface.rm_alloc(self.nvdevice, nv_gpu.KEPLER_CHANNEL_GROUP_A, channel_params)
 
-    self.gpfifo_area = self.iface.alloc(0x300000, contiguous=True, cpu_access=True, force_devmem=True,
+    self.gpfifo_area = self.iface.alloc(0x10000 if self.is_tegra() else 0x300000, contiguous=True, cpu_access=True, force_devmem=True,
       map_flags=(nv_gpu.NVOS33_FLAGS_CACHING_TYPE_WRITECOMBINED<<23))
 
     ctxshare_params = nv_gpu.NV_CTXSHARE_ALLOCATION_PARAMETERS(hVASpace=vaspace, flags=nv_gpu.NV_CTXSHARE_ALLOCATION_FLAGS_SUBCONTEXT_ASYNC)
     ctxshare = self.iface.rm_alloc(self.channel_group, nv_gpu.FERMI_CONTEXT_SHARE_A, ctxshare_params)
 
-    self.compute_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0, entries=0x10000, compute=True)
-    self.dma_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0x100000, entries=0x10000, compute=False)
+    # Tegra: use small per-channel buffers (1024 entries = 8KB ring) to avoid crashing ALLOC_OBJ_CTX.
+    # The kernel maps the ENTIRE gpfifo dmabuf into GPU VA; large buffers fragment VA and crash GR context alloc.
+    if self.is_tegra():
+      tegra_entries = 1024
+      self.compute_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0, entries=tegra_entries, compute=True)
+      self.dma_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group,
+                                            offset=tegra_entries * 8 + 0x1000, entries=tegra_entries, compute=False)
+    else:
+      self.compute_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0, entries=0x10000, compute=True)
+      self.dma_gpfifo = self._new_gpu_fifo(self.gpfifo_area, ctxshare, self.channel_group, offset=0x100000, entries=0x10000, compute=False)
     self.iface.rm_control(self.channel_group, nv_gpu.NVA06C_CTRL_CMD_GPFIFO_SCHEDULE, nv_gpu.NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS(bEnable=1))
 
     self.cmdq_page:HCQBuffer = self.iface.alloc(0x200000, cpu_access=True)
