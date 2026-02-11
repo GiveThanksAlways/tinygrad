@@ -81,11 +81,13 @@ class PTXCompiler(Compiler):
   def disassemble(self, lib:bytes): cuda_disassemble(lib, self.arch, ptx=True)
 
 class NVPTXCompiler(PTXCompiler):
-  def __init__(self, arch:str):
+  def __init__(self, arch:str, extra_opts:tuple[str,...]=()):
     nvrtc_check(jitlink.nvJitLinkVersion(ctypes.byref(ctypes.c_uint()), ctypes.byref(ctypes.c_uint())))
-    super().__init__(arch, cache_key="nv_ptx")
+    self.extra_opts = extra_opts
+    super().__init__(arch, cache_key="nv_ptx" + (",".join(extra_opts) if extra_opts else ""))
   def compile(self, src:str) -> bytes:
-    jitlink_check(jitlink.nvJitLinkCreate(handle := jitlink.nvJitLinkHandle(), 1, to_char_p_p([f'-arch={self.arch}'.encode()])), handle)
+    opts = [f'-arch={self.arch}'.encode()] + [o.encode() for o in self.extra_opts]
+    jitlink_check(jitlink.nvJitLinkCreate(handle := jitlink.nvJitLinkHandle(), len(opts), to_char_p_p(opts)), handle)
     jitlink_check(jitlink.nvJitLinkAddData(handle, jitlink.NVJITLINK_INPUT_PTX, ptxsrc:=super().compile(src), len(ptxsrc), "<null>".encode()), handle)
     jitlink_check(jitlink.nvJitLinkComplete(handle), handle)
     data = _get_bytes(handle, jitlink.nvJitLinkGetLinkedCubin, jitlink.nvJitLinkGetLinkedCubinSize, jitlink_check)
