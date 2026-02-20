@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, ctypes, contextlib, re, functools, mmap, struct, array, sys, weakref
+import os, ctypes, contextlib, re, functools, mmap, struct, array, sys, weakref, fcntl
 assert sys.platform != 'win32'
 from typing import cast, ClassVar
 from dataclasses import dataclass
@@ -571,12 +571,639 @@ class PCIIface(PCIIfaceBase):
     for _ in self.dev_impl.gsp.stat_q.read_resp(): pass
     if self.dev_impl.is_err_state: raise RuntimeError("Device fault detected")
 
+# ============================================================================
+# TegraIface — nvgpu/nvmap backend for Jetson Orin (JetPack 6)
+# ============================================================================
+
+# Linux ioctl direction bits (aarch64)
+_IOC_NONE  = 0; _IOC_WRITE = 1; _IOC_READ  = 2
+def _tegra_IOC(d, t, nr, size): return (d << 30) | (size << 16) | (ord(t) << 8) | nr
+def _tegra_IO(t, nr): return _tegra_IOC(_IOC_NONE, t, nr, 0)
+def _tegra_IOR(t, nr, sz): return _tegra_IOC(_IOC_READ, t, nr, sz)
+def _tegra_IOW(t, nr, sz): return _tegra_IOC(_IOC_WRITE, t, nr, sz)
+def _tegra_IOWR(t, nr, sz): return _tegra_IOC(_IOC_READ | _IOC_WRITE, t, nr, sz)
+
+# ctypes structs for nvgpu/nvmap ioctls
+class _nvgpu_gpu_characteristics(ctypes.Structure):
+  _fields_ = [
+    ("arch", ctypes.c_uint32), ("impl", ctypes.c_uint32), ("rev", ctypes.c_uint32), ("num_gpc", ctypes.c_uint32),
+    ("numa_domain_id", ctypes.c_int32), ("_pad0", ctypes.c_uint32),
+    ("L2_cache_size", ctypes.c_uint64), ("on_board_video_memory_size", ctypes.c_uint64),
+    ("num_tpc_per_gpc", ctypes.c_uint32), ("bus_type", ctypes.c_uint32), ("big_page_size", ctypes.c_uint32),
+    ("compression_page_size", ctypes.c_uint32), ("pde_coverage_bit_count", ctypes.c_uint32),
+    ("available_big_page_sizes", ctypes.c_uint32),
+    ("flags", ctypes.c_uint64),
+    ("twod_class", ctypes.c_uint32), ("threed_class", ctypes.c_uint32), ("compute_class", ctypes.c_uint32),
+    ("gpfifo_class", ctypes.c_uint32), ("inline_to_memory_class", ctypes.c_uint32), ("dma_copy_class", ctypes.c_uint32),
+    ("gpc_mask", ctypes.c_uint32), ("sm_arch_sm_version", ctypes.c_uint32), ("sm_arch_spa_version", ctypes.c_uint32),
+    ("sm_arch_warp_count", ctypes.c_uint32),
+    ("gpu_ioctl_nr_last", ctypes.c_int16), ("tsg_ioctl_nr_last", ctypes.c_int16), ("dbg_gpu_ioctl_nr_last", ctypes.c_int16),
+    ("ioctl_channel_nr_last", ctypes.c_int16), ("as_ioctl_nr_last", ctypes.c_int16),
+    ("gpu_va_bit_count", ctypes.c_uint8), ("reserved", ctypes.c_uint8),
+    ("max_fbps_count", ctypes.c_uint32), ("fbp_en_mask", ctypes.c_uint32), ("emc_en_mask", ctypes.c_uint32),
+    ("max_ltc_per_fbp", ctypes.c_uint32), ("max_lts_per_ltc", ctypes.c_uint32), ("max_tex_per_tpc", ctypes.c_uint32),
+    ("max_gpc_count", ctypes.c_uint32),
+    ("rop_l2_en_mask_DEPRECATED", ctypes.c_uint32 * 2),
+    ("chipname", ctypes.c_uint8 * 8),
+    ("gr_compbit_store_base_hw", ctypes.c_uint64),
+    ("gr_gobs_per_comptagline_per_slice", ctypes.c_uint32), ("num_ltc", ctypes.c_uint32),
+    ("lts_per_ltc", ctypes.c_uint32), ("cbc_cache_line_size", ctypes.c_uint32),
+    ("cbc_comptags_per_line", ctypes.c_uint32), ("map_buffer_batch_limit", ctypes.c_uint32),
+    ("max_freq", ctypes.c_uint64),
+    ("graphics_preemption_mode_flags", ctypes.c_uint32), ("compute_preemption_mode_flags", ctypes.c_uint32),
+    ("default_graphics_preempt_mode", ctypes.c_uint32), ("default_compute_preempt_mode", ctypes.c_uint32),
+    ("local_video_memory_size", ctypes.c_uint64),
+    ("pci_vendor_id", ctypes.c_uint16), ("pci_device_id", ctypes.c_uint16), ("pci_subsystem_vendor_id", ctypes.c_uint16),
+    ("pci_subsystem_device_id", ctypes.c_uint16), ("pci_class", ctypes.c_uint16), ("pci_revision", ctypes.c_uint8),
+    ("vbios_oem_version", ctypes.c_uint8), ("vbios_version", ctypes.c_uint32),
+    ("reg_ops_limit", ctypes.c_uint32), ("reserved1", ctypes.c_uint32),
+    ("event_ioctl_nr_last", ctypes.c_int16), ("pad", ctypes.c_uint16), ("max_css_buffer_size", ctypes.c_uint32),
+    ("ctxsw_ioctl_nr_last", ctypes.c_int16), ("prof_ioctl_nr_last", ctypes.c_int16),
+    ("nvs_ioctl_nr_last", ctypes.c_int16), ("reserved2", ctypes.c_uint8 * 2),
+    ("max_ctxsw_ring_buffer_size", ctypes.c_uint32), ("reserved3", ctypes.c_uint32),
+    ("per_device_identifier", ctypes.c_uint64),
+    ("num_ppc_per_gpc", ctypes.c_uint32), ("max_veid_count_per_tsg", ctypes.c_uint32),
+    ("num_sub_partition_per_fbpa", ctypes.c_uint32), ("gpu_instance_id", ctypes.c_uint32),
+    ("gr_instance_id", ctypes.c_uint32), ("max_gpfifo_entries", ctypes.c_uint32),
+    ("max_dbg_tsg_timeslice", ctypes.c_uint32), ("reserved5", ctypes.c_uint32),
+    ("device_instance_id", ctypes.c_uint64),
+  ]
+
+class _nvgpu_gpu_get_characteristics(ctypes.Structure):
+  _fields_ = [("gpu_characteristics_buf_size", ctypes.c_uint64), ("gpu_characteristics_buf_addr", ctypes.c_uint64)]
+
+class _nvmap_create_handle(ctypes.Structure):
+  _fields_ = [("size", ctypes.c_uint32), ("handle", ctypes.c_uint32)]
+
+class _nvmap_alloc_handle(ctypes.Structure):
+  _fields_ = [("handle", ctypes.c_uint32), ("heap_mask", ctypes.c_uint32), ("flags", ctypes.c_uint32),
+              ("align", ctypes.c_uint32), ("numa_nid", ctypes.c_int32)]
+
+class _nvgpu_alloc_as_args(ctypes.Structure):
+  _fields_ = [("big_page_size", ctypes.c_uint32), ("as_fd", ctypes.c_int32), ("flags", ctypes.c_uint32),
+              ("reserved", ctypes.c_uint32), ("va_range_start", ctypes.c_uint64), ("va_range_end", ctypes.c_uint64),
+              ("va_range_split", ctypes.c_uint64), ("padding", ctypes.c_uint32 * 6)]
+
+class _nvgpu_as_bind_channel_args(ctypes.Structure):
+  _fields_ = [("channel_fd", ctypes.c_uint32)]
+
+class _nvgpu_as_map_buffer_ex_args(ctypes.Structure):
+  _fields_ = [("flags", ctypes.c_uint32), ("compr_kind", ctypes.c_int16), ("incompr_kind", ctypes.c_int16),
+              ("dmabuf_fd", ctypes.c_uint32), ("page_size", ctypes.c_uint32), ("buffer_offset", ctypes.c_uint64),
+              ("mapping_size", ctypes.c_uint64), ("offset", ctypes.c_uint64)]
+
+class _nvgpu_as_unmap_buffer_args(ctypes.Structure):
+  _fields_ = [("offset", ctypes.c_uint64)]
+
+class _nvgpu_gpu_open_tsg_args(ctypes.Structure):
+  _fields_ = [("tsg_fd", ctypes.c_int32), ("flags", ctypes.c_uint32), ("token", ctypes.c_uint32),
+              ("reserved", ctypes.c_uint32), ("subctx_id", ctypes.c_uint32), ("_pad", ctypes.c_uint32)]
+
+class _nvgpu_tsg_bind_channel_ex_args(ctypes.Structure):
+  _fields_ = [("channel_fd", ctypes.c_int32), ("subcontext_id", ctypes.c_uint32), ("reserved", ctypes.c_uint8 * 16)]
+
+class _nvgpu_tsg_create_subcontext_args(ctypes.Structure):
+  _fields_ = [("type", ctypes.c_uint32), ("as_fd", ctypes.c_int32), ("veid", ctypes.c_uint32), ("reserved", ctypes.c_uint32)]
+
+class _nvgpu_gpu_open_channel_args(ctypes.Structure):
+  _fields_ = [("channel_fd", ctypes.c_int32)]
+
+class _nvgpu_alloc_obj_ctx_args(ctypes.Structure):
+  _fields_ = [("class_num", ctypes.c_uint32), ("flags", ctypes.c_uint32), ("obj_id", ctypes.c_uint64)]
+
+class _nvgpu_channel_setup_bind_args(ctypes.Structure):
+  _fields_ = [("num_gpfifo_entries", ctypes.c_uint32), ("num_inflight_jobs", ctypes.c_uint32),
+              ("flags", ctypes.c_uint32), ("userd_dmabuf_fd", ctypes.c_int32), ("gpfifo_dmabuf_fd", ctypes.c_int32),
+              ("work_submit_token", ctypes.c_uint32), ("userd_dmabuf_offset", ctypes.c_uint64),
+              ("gpfifo_dmabuf_offset", ctypes.c_uint64), ("gpfifo_gpu_va", ctypes.c_uint64),
+              ("userd_gpu_va", ctypes.c_uint64), ("usermode_mmio_gpu_va", ctypes.c_uint64),
+              ("reserved", ctypes.c_uint32 * 9)]
+
+class _nvgpu_channel_wdt_args(ctypes.Structure):
+  _fields_ = [("wdt_status", ctypes.c_uint32), ("timeout_ms", ctypes.c_uint32)]
+
+class _nvgpu_get_user_syncpoint_args(ctypes.Structure):
+  _fields_ = [("gpu_va", ctypes.c_uint64), ("syncpoint_id", ctypes.c_uint32), ("syncpoint_max", ctypes.c_uint32)]
+
+# --- nvgpu/nvmap ioctl codes ---
+_NVGPU_GPU_IOCTL_GET_CHARACTERISTICS = _tegra_IOWR('G', 5, ctypes.sizeof(_nvgpu_gpu_get_characteristics))
+_NVGPU_GPU_IOCTL_ALLOC_AS = _tegra_IOWR('G', 8, ctypes.sizeof(_nvgpu_alloc_as_args))
+_NVGPU_GPU_IOCTL_OPEN_TSG = _tegra_IOWR('G', 9, ctypes.sizeof(_nvgpu_gpu_open_tsg_args))
+_NVGPU_GPU_IOCTL_OPEN_CHANNEL = _tegra_IOWR('G', 11, ctypes.sizeof(_nvgpu_gpu_open_channel_args))
+_NVMAP_IOC_CREATE = _tegra_IOWR('N', 0, ctypes.sizeof(_nvmap_create_handle))
+_NVMAP_IOC_ALLOC = _tegra_IOW('N', 3, ctypes.sizeof(_nvmap_alloc_handle))
+_NVMAP_IOC_GET_FD = _tegra_IOWR('N', 15, ctypes.sizeof(_nvmap_create_handle))
+_NVMAP_IOC_FREE = _tegra_IO('N', 4)
+_NVGPU_AS_IOCTL_BIND_CHANNEL = _tegra_IOWR('A', 1, ctypes.sizeof(_nvgpu_as_bind_channel_args))
+_NVGPU_AS_IOCTL_MAP_BUFFER_EX = _tegra_IOWR('A', 7, ctypes.sizeof(_nvgpu_as_map_buffer_ex_args))
+_NVGPU_AS_IOCTL_UNMAP_BUFFER = _tegra_IOWR('A', 5, ctypes.sizeof(_nvgpu_as_unmap_buffer_args))
+_NVGPU_TSG_IOCTL_BIND_CHANNEL_EX = _tegra_IOWR('T', 11, ctypes.sizeof(_nvgpu_tsg_bind_channel_ex_args))
+_NVGPU_TSG_IOCTL_CREATE_SUBCONTEXT = _tegra_IOWR('T', 18, ctypes.sizeof(_nvgpu_tsg_create_subcontext_args))
+_NVGPU_IOCTL_CHANNEL_ALLOC_OBJ_CTX = _tegra_IOWR('H', 108, ctypes.sizeof(_nvgpu_alloc_obj_ctx_args))
+_NVGPU_IOCTL_CHANNEL_SETUP_BIND = _tegra_IOWR('H', 128, ctypes.sizeof(_nvgpu_channel_setup_bind_args))
+_NVGPU_IOCTL_CHANNEL_WDT = _tegra_IOW('H', 119, ctypes.sizeof(_nvgpu_channel_wdt_args))
+_NVGPU_IOCTL_CHANNEL_GET_USER_SYNCPOINT = _tegra_IOR('H', 126, ctypes.sizeof(_nvgpu_get_user_syncpoint_args))
+_NVGPU_IOCTL_CHANNEL_SET_ERROR_NOTIFIER = _tegra_IOWR('H', 111, 24) # struct is 24 bytes
+
+# nvmap heap/flag constants
+_NVMAP_HEAP_IOVMM = (1 << 30)
+_NVMAP_HANDLE_WRITE_COMBINE = 1
+_NVMAP_HANDLE_INNER_CACHEABLE = 2
+
+# SETUP_BIND flags
+_NVGPU_SETUP_BIND_FLAGS_USERMODE_SUPPORT = (1 << 3)
+_NVGPU_SETUP_BIND_FLAGS_DETERMINISTIC = (1 << 1)
+
+def _tegra_ioctl(fd, ioc_code, buf):
+  """Call an ioctl on a raw fd, raise on error."""
+  ret = fcntl.ioctl(fd, ioc_code, buf)
+  if ret < 0: raise OSError(f"tegra ioctl 0x{ioc_code:08x} failed with {ret}")
+  return ret
+
+@dataclass
+class _TegraMem:
+  """Metadata for a Tegra nvmap allocation."""
+  handle: int
+  dmabuf_fd: int
+  gpu_va: int
+  size: int
+  cpu_addr: int = 0  # CPU mmap base address
+  hMemory: int = 0  # compatibility with NVKIface's mem.meta.hMemory
+
+class TegraIface:
+  """nvgpu/nvmap backend for Jetson Orin (JetPack 6). Replaces NVKIface/PCIIface for Tegra SoC GPUs."""
+  _inited: ClassVar[bool] = False
+  _nvmap_fd: ClassVar[int] = -1
+  _ctrl_fd: ClassVar[int] = -1
+  _chars: ClassVar[_nvgpu_gpu_characteristics|None] = None
+
+  def __init__(self, dev, device_id):
+    if device_id != 0: raise RuntimeError("TegraIface only supports device 0 (single iGPU)")
+
+    # Open device nodes (class-level, shared across instances)
+    if not TegraIface._inited:
+      if not os.path.exists("/dev/nvgpu/igpu0/ctrl"): raise FileNotFoundError("/dev/nvgpu/igpu0/ctrl")
+      TegraIface._nvmap_fd = os.open("/dev/nvmap", os.O_RDWR | os.O_SYNC)
+      TegraIface._ctrl_fd = os.open("/dev/nvgpu/igpu0/ctrl", os.O_RDWR)
+
+      # GET_CHARACTERISTICS
+      chars = _nvgpu_gpu_characteristics()
+      ctypes.memset(ctypes.addressof(chars), 0, ctypes.sizeof(chars))
+      req = _nvgpu_gpu_get_characteristics()
+      req.gpu_characteristics_buf_size = ctypes.sizeof(chars)
+      req.gpu_characteristics_buf_addr = ctypes.addressof(chars)
+      _tegra_ioctl(TegraIface._ctrl_fd, _NVGPU_GPU_IOCTL_GET_CHARACTERISTICS, req)
+      TegraIface._chars = chars
+      TegraIface._inited = True
+
+    self.dev, self.device_id = dev, device_id
+    chars = TegraIface._chars
+    assert chars is not None
+
+    # GPU classes from characteristics
+    self.compute_class = chars.compute_class    # 0xc7c0 (AMPERE_COMPUTE_B)
+    self.gpfifo_class = chars.gpfifo_class      # 0xc76f
+    self.dma_class = chars.dma_copy_class       # 0xc7b5 (AMPERE_DMA_COPY_B)
+    self.viddec_class = None                    # no video decode via nvgpu
+
+    # GPU info for _query_gpu_info translation
+    self._gpu_chars = chars
+    self._sm_version = chars.sm_arch_sm_version  # 0x807 for SM 8.7
+
+    # RM handle emulation: maps fake handles → state
+    self._handle_counter = 0x10000
+    self._handles: dict[int, dict] = {}
+
+    # Address space state (created during rm_alloc of NV01_MEMORY_VIRTUAL)
+    self._as_fd: int = -1
+
+    # Channel/TSG state (created during rm_alloc of channel classes)
+    self._tsg_fd: int = -1
+    self._ch_fds: dict[int, int] = {}  # handle → channel fd
+    self._subctx_veid: int = 0
+    self._work_submit_tokens: dict[int, int] = {}  # channel handle → token
+    self._gpfifo_setup: dict[int, dict] = {}  # channel handle → setup info
+
+    # Root / device / subdevice fake handles
+    self.root = self._next_handle()
+    self.gpu_instance = 0
+
+    # Allocations tracking
+    self._allocs: list[_TegraMem] = []
+
+  def _next_handle(self) -> int:
+    self._handle_counter += 1
+    return self._handle_counter
+
+  def rm_alloc(self, parent, clss, params=None, root=None) -> int:
+    """Translate RM object allocations to nvgpu equivalents."""
+    handle = self._next_handle()
+
+    if clss == nv_gpu.NV01_DEVICE_0:
+      # No nvgpu equivalent — just a hierarchy container
+      self._handles[handle] = {"type": "device"}
+      return handle
+
+    if clss == nv_gpu.NV20_SUBDEVICE_0:
+      # No nvgpu equivalent — hierarchy container
+      self._handles[handle] = {"type": "subdevice"}
+      return handle
+
+    if clss == nv_gpu.NV01_MEMORY_VIRTUAL:
+      # Create address space via ALLOC_AS
+      args = _nvgpu_alloc_as_args()
+      PDE_SIZE = 1 << 21
+      args.big_page_size = 0
+      args.flags = 2  # UNIFIED_VA
+      args.va_range_start = PDE_SIZE
+      args.va_range_end = (1 << 40) - PDE_SIZE
+      args.va_range_split = 0
+      _tegra_ioctl(self._ctrl_fd, _NVGPU_GPU_IOCTL_ALLOC_AS, args)
+      self._as_fd = args.as_fd
+      self._handles[handle] = {"type": "virtmem", "as_fd": self._as_fd}
+      return handle
+
+    if clss == nv_gpu.FERMI_VASPACE_A:
+      # Already have AS from NV01_MEMORY_VIRTUAL — NOP
+      self._handles[handle] = {"type": "vaspace"}
+      return handle
+
+    if clss == nv_gpu.KEPLER_CHANNEL_GROUP_A:
+      # Create TSG
+      tsg_args = _nvgpu_gpu_open_tsg_args()
+      tsg_args.flags = 0
+      _tegra_ioctl(self._ctrl_fd, _NVGPU_GPU_IOCTL_OPEN_TSG, tsg_args)
+      self._tsg_fd = tsg_args.tsg_fd
+      self._handles[handle] = {"type": "tsg", "tsg_fd": self._tsg_fd}
+      return handle
+
+    if clss == nv_gpu.FERMI_CONTEXT_SHARE_A:
+      # Create subcontext in TSG
+      subctx = _nvgpu_tsg_create_subcontext_args()
+      subctx.type = 1  # ASYNC for compute
+      subctx.as_fd = self._as_fd
+      _tegra_ioctl(self._tsg_fd, _NVGPU_TSG_IOCTL_CREATE_SUBCONTEXT, subctx)
+      self._subctx_veid = subctx.veid
+      self._handles[handle] = {"type": "ctxshare", "veid": subctx.veid}
+      return handle
+
+    if clss == self.gpfifo_class or clss == nv_gpu.AMPERE_CHANNEL_GPFIFO_A:
+      # Full channel setup: OPEN_CHANNEL → AS_BIND → TSG_BIND → WDT → SETUP_BIND
+      ch_args = _nvgpu_gpu_open_channel_args()
+      ch_args.channel_fd = -1  # auto runlist
+      _tegra_ioctl(self._ctrl_fd, _NVGPU_GPU_IOCTL_OPEN_CHANNEL, ch_args)
+      ch_fd = ch_args.channel_fd
+
+      # Bind channel to AS (must be before TSG bind)
+      as_bind = _nvgpu_as_bind_channel_args()
+      as_bind.channel_fd = ch_fd
+      _tegra_ioctl(self._as_fd, _NVGPU_AS_IOCTL_BIND_CHANNEL, as_bind)
+
+      # Bind channel to TSG
+      tsg_bind = _nvgpu_tsg_bind_channel_ex_args()
+      tsg_bind.channel_fd = ch_fd
+      tsg_bind.subcontext_id = self._subctx_veid
+      _tegra_ioctl(self._tsg_fd, _NVGPU_TSG_IOCTL_BIND_CHANNEL_EX, tsg_bind)
+
+      # Disable watchdog
+      wdt = _nvgpu_channel_wdt_args()
+      wdt.wdt_status = 1  # disable
+      _tegra_ioctl(ch_fd, _NVGPU_IOCTL_CHANNEL_WDT, wdt)
+
+      # Extract params from NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS
+      gpfifo_va = 0
+      userd_buf_offset = 0  # offset of userd region within the gpfifo_area dmabuf
+      gpfifo_entries = 0x10000  # default
+      gpfifo_buf_handle = 0
+
+      if params is not None:
+        gpfifo_va = params.gpFifoOffset
+        gpfifo_entries = params.gpFifoEntries
+        gpfifo_buf_handle = params.hObjectBuffer
+        userd_buf_offset = params.userdOffset[0]  # entries*8 + offset — dmabuf-relative
+
+      # Find the gpfifo_area's _TegraMem to get its dmabuf_fd and GPU VA
+      gpfifo_area_mem = None
+      for mem in self._allocs:
+        if mem.hMemory == gpfifo_buf_handle:
+          gpfifo_area_mem = mem
+          break
+      if gpfifo_area_mem is None:
+        raise RuntimeError(f"TegraIface: can't find gpfifo_area alloc for handle {gpfifo_buf_handle}")
+
+      gpfifo_dmabuf_fd = gpfifo_area_mem.dmabuf_fd
+      gpfifo_dmabuf_offset = gpfifo_va - gpfifo_area_mem.gpu_va  # offset within dmabuf where GPFIFO ring starts
+
+      # nvgpu SETUP_BIND requires SEPARATE dmabuf fds for gpfifo and userd.
+      # Allocate a separate 4KB nvmap buffer for userd.
+      USERD_SIZE = 4096
+      ucreate = _nvmap_create_handle()
+      ucreate.size = USERD_SIZE
+      _tegra_ioctl(self._nvmap_fd, _NVMAP_IOC_CREATE, ucreate)
+      ualloc = _nvmap_alloc_handle()
+      ualloc.handle = ucreate.handle
+      ualloc.heap_mask = _NVMAP_HEAP_IOVMM
+      ualloc.flags = _NVMAP_HANDLE_WRITE_COMBINE
+      ualloc.align = 4096
+      _tegra_ioctl(self._nvmap_fd, _NVMAP_IOC_ALLOC, ualloc)
+      ugetfd = _nvmap_create_handle()
+      ugetfd.handle = ucreate.handle
+      _tegra_ioctl(self._nvmap_fd, _NVMAP_IOC_GET_FD, ugetfd)
+      userd_dmabuf_fd = ugetfd.size  # dmabuf fd in .size field
+
+      # SETUP_BIND with separate dmabuf fds
+      setup = _nvgpu_channel_setup_bind_args()
+      setup.num_gpfifo_entries = gpfifo_entries
+      setup.num_inflight_jobs = 0
+      setup.gpfifo_dmabuf_fd = gpfifo_dmabuf_fd
+      setup.gpfifo_dmabuf_offset = gpfifo_dmabuf_offset
+      setup.userd_dmabuf_fd = userd_dmabuf_fd
+      setup.userd_dmabuf_offset = 0
+      setup.flags = _NVGPU_SETUP_BIND_FLAGS_USERMODE_SUPPORT | _NVGPU_SETUP_BIND_FLAGS_DETERMINISTIC
+
+      if getenv("DEBUG", 0) >= 1:
+        print(f"TegraIface SETUP_BIND: ch_fd={ch_fd} entries={setup.num_gpfifo_entries} "
+              f"gpfifo_dmabuf_fd={gpfifo_dmabuf_fd} gpfifo_off={setup.gpfifo_dmabuf_offset} "
+              f"userd_dmabuf_fd={userd_dmabuf_fd} userd_off=0 flags=0x{setup.flags:x}")
+
+      _tegra_ioctl(ch_fd, _NVGPU_IOCTL_CHANNEL_SETUP_BIND, setup)
+
+      # Now mmap the userd dmabuf over the userd region in gpfifo_area's CPU mapping.
+      # tinygrad reads/writes GPPut/GPGet at: gpfifo_area_cpu_base + userd_buf_offset
+      # We overlay the userd dmabuf there so GPU and CPU share the same physical page.
+      import ctypes as ct
+      libc_so = ct.CDLL("libc.so.6", use_errno=True)
+      libc_so.mmap.restype = ct.c_void_p
+      libc_so.mmap.argtypes = [ct.c_void_p, ct.c_size_t, ct.c_int, ct.c_int, ct.c_int, ct.c_long]
+
+      userd_cpu_target = gpfifo_area_mem.cpu_addr + userd_buf_offset
+      overlay_addr = libc_so.mmap(ct.c_void_p(userd_cpu_target), USERD_SIZE,
+                                  mmap.PROT_READ | mmap.PROT_WRITE,
+                                  mmap.MAP_SHARED | MAP_FIXED,
+                                  userd_dmabuf_fd, 0)
+      if overlay_addr is None or overlay_addr == ct.c_void_p(-1).value or overlay_addr == 0xffffffffffffffff:
+        raise RuntimeError(f"TegraIface: userd overlay mmap failed (errno={ct.get_errno()})")
+
+      self._ch_fds[handle] = ch_fd
+      self._work_submit_tokens[handle] = setup.work_submit_token
+      self._gpfifo_setup[handle] = {
+        "ch_fd": ch_fd, "token": setup.work_submit_token,
+        "gpfifo_gpu_va": setup.gpfifo_gpu_va, "userd_gpu_va": setup.userd_gpu_va,
+      }
+      self._handles[handle] = {"type": "channel", "ch_fd": ch_fd, "token": setup.work_submit_token}
+      return handle
+
+    if clss == self.compute_class or clss == nv_gpu.AMPERE_COMPUTE_B:
+      # Allocate compute class on channel
+      ch_fd = self._ch_fds.get(parent, -1)
+      if ch_fd == -1: raise RuntimeError(f"TegraIface: no channel fd for handle {parent}")
+      obj = _nvgpu_alloc_obj_ctx_args()
+      obj.class_num = self.compute_class
+      _tegra_ioctl(ch_fd, _NVGPU_IOCTL_CHANNEL_ALLOC_OBJ_CTX, obj)
+      self._handles[handle] = {"type": "compute_obj"}
+      return handle
+
+    if clss == self.dma_class or clss == nv_gpu.AMPERE_DMA_COPY_B:
+      # Allocate DMA copy class on channel
+      ch_fd = self._ch_fds.get(parent, -1)
+      if ch_fd == -1: raise RuntimeError(f"TegraIface: no channel fd for handle {parent}")
+      obj = _nvgpu_alloc_obj_ctx_args()
+      obj.class_num = self.dma_class
+      _tegra_ioctl(ch_fd, _NVGPU_IOCTL_CHANNEL_ALLOC_OBJ_CTX, obj)
+      self._handles[handle] = {"type": "dma_obj"}
+      return handle
+
+    if clss == nv_gpu.GT200_DEBUGGER:
+      # Skip debugger on Tegra — not needed
+      self._handles[handle] = {"type": "debugger_stub"}
+      return handle
+
+    if clss == nv_gpu.NV01_ROOT_CLIENT or clss == nv_gpu.NV01_ROOT:
+      self._handles[handle] = {"type": "root"}
+      return handle
+
+    if clss in (getattr(nv_gpu, 'NV1_MEMORY_SYSTEM', 0), getattr(nv_gpu, 'NV1_MEMORY_USER', 0),
+                getattr(nv_gpu, 'NV01_MEMORY_SYSTEM_OS_DESCRIPTOR', 0)):
+      # These are used for device memory allocation by NVKIface but we handle alloc() directly
+      self._handles[handle] = {"type": "mem_alloc_stub"}
+      return handle
+
+    # For any other class, stub it out with a warning
+    self._handles[handle] = {"type": f"stub_{clss:#x}"}
+    return handle
+
+  def rm_control(self, obj, cmd, params=None):
+    """Translate RM control calls to nvgpu equivalents."""
+    # NV2080_CTRL_CMD_PERF_BOOST — boost GPU frequency
+    if cmd == nv_gpu.NV2080_CTRL_CMD_PERF_BOOST:
+      # Try to set max GPU frequency via devfreq sysfs
+      try:
+        with open("/sys/class/devfreq/17000000.gpu/max_freq") as f: max_freq = f.read().strip()
+        with open("/sys/class/devfreq/17000000.gpu/min_freq", "w") as f: f.write(max_freq)
+      except (OSError, IOError): pass  # best-effort
+      return params
+
+    # NVA06C_CTRL_CMD_GPFIFO_SCHEDULE — NOP on Tegra (channels auto-schedule)
+    if cmd == nv_gpu.NVA06C_CTRL_CMD_GPFIFO_SCHEDULE:
+      return params
+
+    # NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN
+    if cmd == nv_gpu.NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN:
+      # Return the saved token from SETUP_BIND for this channel handle
+      token = self._work_submit_tokens.get(obj, 0)
+      if params is not None: params.workSubmitToken = token
+      return params
+
+    # NV2080_CTRL_CMD_GR_GET_INFO — translate to GET_CHARACTERISTICS fields
+    if cmd == nv_gpu.NV2080_CTRL_CMD_GR_GET_INFO:
+      chars = self._gpu_chars
+      # Build a mapping from GR_INFO_INDEX to values from characteristics
+      info_map = {
+        getattr(nv_gpu, 'NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_GPCS', None): chars.num_gpc,
+        getattr(nv_gpu, 'NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_TPC_PER_GPC', None): chars.num_tpc_per_gpc,
+        getattr(nv_gpu, 'NV2080_CTRL_GR_INFO_INDEX_LITTER_NUM_SM_PER_TPC', None): 2,  # ga10b has 2 SMs per TPC
+        getattr(nv_gpu, 'NV2080_CTRL_GR_INFO_INDEX_MAX_WARPS_PER_SM', None): chars.sm_arch_warp_count,
+        getattr(nv_gpu, 'NV2080_CTRL_GR_INFO_INDEX_SM_VERSION', None): chars.sm_arch_sm_version,
+      }
+      info_map = {k: v for k, v in info_map.items() if k is not None}
+
+      if params is not None:
+        info_list_addr = params.grInfoList
+        for i in range(params.grInfoListSize):
+          info = nv_gpu.NV2080_CTRL_GR_INFO.from_address(info_list_addr + i * ctypes.sizeof(nv_gpu.NV2080_CTRL_GR_INFO))
+          info.data = info_map.get(info.index, 0)
+      return params
+
+    # NV0080_CTRL_CMD_GPU_GET_CLASSLIST — return known classes
+    if cmd == nv_gpu.NV0080_CTRL_CMD_GPU_GET_CLASSLIST:
+      if params is not None:
+        known_classes = [self.compute_class, self.gpfifo_class, self.dma_class, nv_gpu.TURING_USERMODE_A]
+        if params.numClasses == 0:
+          params.numClasses = len(known_classes)
+        else:
+          cl = to_mv(params.classList, params.numClasses * 4).cast('I')
+          for i, c in enumerate(known_classes[:params.numClasses]): cl[i] = c
+      return params
+
+    # NV2080_CTRL_CMD_GPU_GET_GID_INFO — return synthetic UUID
+    if cmd == nv_gpu.NV2080_CTRL_CMD_GPU_GET_GID_INFO:
+      if params is not None:
+        params.length = 16
+        for i in range(16): params.data[i] = (0x4A + i) & 0xFF  # 'J' for Jetson + sequential
+      return params
+
+    # NV2080_CTRL_CMD_FB_FLUSH_GPU_CACHE — NOP on Tegra with IO_COHERENCE
+    if cmd == getattr(nv_gpu, 'NV2080_CTRL_CMD_FB_FLUSH_GPU_CACHE', 0):
+      return params
+
+    # NVA06F_CTRL_CMD_BIND — NOP, channels already bound to engine during setup
+    if cmd == getattr(nv_gpu, 'NVA06F_CTRL_CMD_BIND', 0):
+      return params
+
+    # NVA06F_CTRL_CMD_GPFIFO_SCHEDULE — NOP
+    if cmd == getattr(nv_gpu, 'NVA06F_CTRL_CMD_GPFIFO_SCHEDULE', 0):
+      return params
+
+    # NV2080_CTRL_CMD_GR_GET_TPC_MASK — return TPC mask from characteristics
+    if cmd == getattr(nv_gpu, 'NV2080_CTRL_CMD_GR_GET_TPC_MASK', 0):
+      if params is not None: params.tpcMask = (1 << self._gpu_chars.num_tpc_per_gpc) - 1
+      return params
+
+    # For any unrecognized control cmd, return params as-is (NOP)
+    return params
+
+  def setup_usermode(self):
+    """Return (handle, mmio_interface_for_doorbell).
+    On Tegra, the doorbell is at offset 0x90 of the mmap'd ctrl fd."""
+    import ctypes as ct
+    libc_so = ct.CDLL("libc.so.6", use_errno=True)
+    libc_so.mmap.restype = ct.c_void_p
+    libc_so.mmap.argtypes = [ct.c_void_p, ct.c_size_t, ct.c_int, ct.c_int, ct.c_int, ct.c_long]
+    addr = libc_so.mmap(None, 0x10000, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, self._ctrl_fd, 0)
+    if addr is None or addr == ct.c_void_p(-1).value or addr == 0xffffffffffffffff:
+      raise RuntimeError(f"TegraIface: failed to mmap ctrl fd for doorbell (errno={ct.get_errno()})")
+
+    return 0, MMIOInterface(addr, 0x10000, fmt='I')
+
+  def setup_vm(self, vaspace):
+    """On Tegra, AS is already set up — NOP."""
+    pass
+
+  def setup_gpfifo_vm(self, gpfifo):
+    """On Tegra, channel is already bound to AS — NOP."""
+    pass
+
+  def alloc(self, size: int, host=False, uncached=False, cpu_access=False, contiguous=False,
+            map_flags=0, cpu_addr=None, force_devmem=False, **kwargs) -> HCQBuffer:
+    """Allocate GPU memory via nvmap: CREATE → ALLOC → GET_FD → MAP_BUFFER_EX → mmap."""
+    page_size = mmap.PAGESIZE
+    size = round_up(size, page_size)
+
+    # Use inner cacheable for device memory, write-combine for uncached/host
+    cache_flags = _NVMAP_HANDLE_WRITE_COMBINE if (uncached or host) else _NVMAP_HANDLE_INNER_CACHEABLE
+    if kwargs.get('cpu_cached'): cache_flags = _NVMAP_HANDLE_INNER_CACHEABLE
+
+    # Step 1: nvmap CREATE
+    create = _nvmap_create_handle()
+    create.size = size
+    _tegra_ioctl(self._nvmap_fd, _NVMAP_IOC_CREATE, create)
+    handle = create.handle
+
+    # Step 2: nvmap ALLOC
+    alloc_args = _nvmap_alloc_handle()
+    alloc_args.handle = handle
+    alloc_args.heap_mask = _NVMAP_HEAP_IOVMM
+    alloc_args.flags = cache_flags
+    alloc_args.align = page_size
+    alloc_args.numa_nid = 0
+    _tegra_ioctl(self._nvmap_fd, _NVMAP_IOC_ALLOC, alloc_args)
+
+    # Step 3: GET_FD (dmabuf)
+    get_fd = _nvmap_create_handle()
+    get_fd.handle = handle
+    _tegra_ioctl(self._nvmap_fd, _NVMAP_IOC_GET_FD, get_fd)
+    dmabuf_fd = get_fd.size  # fd returned in size field
+
+    # Step 4: MAP_BUFFER_EX — get GPU VA
+    gpu_va = 0
+    if self._as_fd >= 0:
+      map_args = _nvgpu_as_map_buffer_ex_args()
+      map_args.flags = 0  # let kernel pick address
+      map_args.compr_kind = -1
+      map_args.incompr_kind = 0
+      map_args.dmabuf_fd = dmabuf_fd
+      map_args.page_size = page_size
+      map_args.buffer_offset = 0
+      map_args.mapping_size = 0  # whole buffer
+      map_args.offset = 0  # kernel picks
+      _tegra_ioctl(self._as_fd, _NVGPU_AS_IOCTL_MAP_BUFFER_EX, map_args)
+      gpu_va = map_args.offset
+
+    # Step 5: mmap to CPU — always mmap on Tegra (unified memory)
+    import ctypes as ct
+    libc_so = ct.CDLL("libc.so.6", use_errno=True)
+    libc_so.mmap.restype = ct.c_void_p
+    libc_so.mmap.argtypes = [ct.c_void_p, ct.c_size_t, ct.c_int, ct.c_int, ct.c_int, ct.c_long]
+    addr = libc_so.mmap(None, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, dmabuf_fd, 0)
+    if addr is None or addr == ct.c_void_p(-1).value or addr == 0xffffffffffffffff:
+      raise RuntimeError(f"TegraIface: mmap dmabuf_fd={dmabuf_fd} size={size} failed (errno={ct.get_errno()})")
+    view = MMIOInterface(addr, size, fmt='B')
+
+    # Assign a fake hMemory handle for RM-style tracking used by NVDevice
+    fake_hmemory = self._next_handle()
+
+    meta = _TegraMem(handle=handle, dmabuf_fd=dmabuf_fd, gpu_va=gpu_va, size=size, cpu_addr=addr, hMemory=fake_hmemory)
+    self._allocs.append(meta)
+
+    return HCQBuffer(va_addr=gpu_va, size=size, meta=meta, view=view, owner=self.dev)
+
+  def free(self, mem: HCQBuffer):
+    """Free a Tegra allocation."""
+    meta = mem.meta
+    if not isinstance(meta, _TegraMem): return
+
+    # Unmap from GPU VA
+    if meta.gpu_va and self._as_fd >= 0:
+      try:
+        unmap = _nvgpu_as_unmap_buffer_args()
+        unmap.offset = meta.gpu_va
+        _tegra_ioctl(self._as_fd, _NVGPU_AS_IOCTL_UNMAP_BUFFER, unmap)
+      except OSError: pass
+
+    # Unmap CPU view
+    if mem.view is not None:
+      try: FileIOInterface.munmap(int(mem.va_addr) if mem.view is None else mem.view._addr, mem.size)
+      except Exception: pass
+
+    # Close dmabuf fd
+    if meta.dmabuf_fd >= 0:
+      try: os.close(meta.dmabuf_fd)
+      except OSError: pass
+
+    # Free nvmap handle
+    if meta.handle != 0:
+      try:
+        signed_handle = meta.handle if meta.handle < 0x80000000 else meta.handle - 0x100000000
+        fcntl.ioctl(self._nvmap_fd, _NVMAP_IOC_FREE, signed_handle)
+      except OSError: pass
+
+    if meta in self._allocs: self._allocs.remove(meta)
+
+  def map(self, mem: HCQBuffer):
+    """Cross-device mapping. Tegra is single-GPU, so just identity-map."""
+    pass
+
+  def sleep(self, tm: int):
+    """Sleep during long operations."""
+    pass
+
 class NVDevice(HCQCompiled[NVSignal]):
   def is_nvd(self) -> bool: return isinstance(self.iface, PCIIface)
+  def is_tegra(self) -> bool: return isinstance(self.iface, TegraIface)
 
   def __init__(self, device:str=""):
     self.device_id = int(device.split(":")[1]) if ":" in device else 0
-    self.iface = self._select_iface(NVKIface, PCIIface)
+    self.iface = self._select_iface(TegraIface, NVKIface, PCIIface)
 
     device_params = nv_gpu.NV0080_ALLOC_PARAMETERS(deviceId=self.iface.gpu_instance, hClientShare=self.iface.root,
                                                    vaMode=nv_gpu.NV_DEVICE_ALLOCATION_VAMODE_OPTIONAL_MULTIPLE_VASPACES)
@@ -625,7 +1252,7 @@ class NVDevice(HCQCompiled[NVSignal]):
        (functools.partial(CUDARenderer, self.arch, use_nvcc=True), NV_NVCC)])
     super().__init__(device, NVAllocator(self), compilers, functools.partial(NVProgram, self), NVSignal, NVComputeQueue, NVCopyQueue)
 
-    self.pma_enabled = PMA.value > 0 and PROFILE >= 1
+    self.pma_enabled = PMA.value > 0 and PROFILE >= 1 and not self.is_tegra()
     if self.pma_enabled: self._prof_init()
 
     self._setup_gpfifos()
@@ -672,7 +1299,11 @@ class NVDevice(HCQCompiled[NVSignal]):
     self.slm_per_thread, self.shader_local_mem = 0, None
 
     # Set windows addresses to not collide with other allocated buffers.
-    self.shared_mem_window, self.local_mem_window = 0x729400000000, 0x729300000000
+    # Tegra has 40-bit VA space (max 0xFFFFFFFFFF), desktop has 43-bit+.
+    if self.is_tegra():
+      self.shared_mem_window, self.local_mem_window = 0xFE00000000, 0xFD00000000
+    else:
+      self.shared_mem_window, self.local_mem_window = 0x729400000000, 0x729300000000
 
     NVComputeQueue().setup(compute_class=self.iface.compute_class, local_mem_window=self.local_mem_window, shared_mem_window=self.shared_mem_window) \
                     .signal(self.timeline_signal, self.next_timeline()).submit(self)
@@ -727,6 +1358,9 @@ class NVDevice(HCQCompiled[NVSignal]):
   def on_device_hang(self):
     # Prepare fault report.
     # TODO: Restore the GPU using NV83DE_CTRL_CMD_CLEAR_ALL_SM_ERROR_STATES if needed.
+
+    if self.is_tegra():
+      raise RuntimeError("GPU hang detected on Tegra device (no detailed fault info available via nvgpu)")
 
     report = []
     sm_errors = self.iface.rm_control(self.debugger, nv_gpu.NV83DE_CTRL_CMD_DEBUG_READ_ALL_SM_ERROR_STATES,
