@@ -127,6 +127,8 @@ class NVCommandQueue(HWQueue[HCQSignal, 'NVDevice', 'NVProgram', 'NVArgsState'])
     gpfifo.put_value += 1
 
 class NVComputeQueue(NVCommandQueue):
+  _tegra_signal: ClassVar[bool] = False  # Set True on Tegra to force pushbuffer signal (avoids QMD reuse race)
+
   def memory_barrier(self):
     self.nvm(1, nv_gpu.NVC6C0_INVALIDATE_SHADER_CACHES_NO_WFI,
              nv_flags("NVC6C0_INVALIDATE_SHADER_CACHES_NO_WFI", instruction="true", global_data="true", constant="true"))
@@ -158,6 +160,13 @@ class NVComputeQueue(NVCommandQueue):
     return self
 
   def signal(self, signal:HCQSignal, value:sint=0):
+    # On Tegra, force pushbuffer-based signal release instead of QMD-based.
+    # QMD-based release stores the signal value in shared QMD memory, which gets overwritten by subsequent submits.
+    # On Tegra (fast MMIO doorbell), the CPU can submit the next iteration before the GPU reads the current QMD,
+    # causing the GPU to read the wrong release value. Pushbuffer-based release avoids this because each submit
+    # copies the pushbuffer to a unique offset in cmdq_page (bump-allocated), so signal values are immutable.
+    if self._tegra_signal: self.active_qmd = None
+
     if self.active_qmd is not None:
       for i in range(2):
         if self.active_qmd.read(f'release{i}_enable') == 0:
@@ -326,7 +335,8 @@ class NVProgram(HCQProgram):
 
 class NVAllocator(HCQAllocator['NVDevice']):
   def _alloc(self, size:int, options:BufferSpec) -> HCQBuffer:
-    return self.dev.iface.alloc(size, cpu_access=options.cpu_access, host=options.host)
+    uncached = options.uncached
+    return self.dev.iface.alloc(size, cpu_access=options.cpu_access, host=options.host, uncached=uncached)
 
   def _do_free(self, opaque:HCQBuffer, options:BufferSpec): self.dev.iface.free(opaque)
 
@@ -709,6 +719,7 @@ _NVGPU_IOCTL_CHANNEL_SET_ERROR_NOTIFIER = _tegra_IOWR('H', 111, 24) # struct is 
 _NVMAP_HEAP_IOVMM = (1 << 30)
 _NVMAP_HANDLE_WRITE_COMBINE = 1
 _NVMAP_HANDLE_INNER_CACHEABLE = 2
+_NVMAP_TAG_TINYGRAD = 0x0900  # tag in bits [31:16] of flags — identifies subsystem to kernel (silences nvmap_alloc_handle WARNING)
 
 # SETUP_BIND flags
 _NVGPU_SETUP_BIND_FLAGS_USERMODE_SUPPORT = (1 << 3)
@@ -908,7 +919,7 @@ class TegraIface:
       galloc = _nvmap_alloc_handle()
       galloc.handle = gcreate.handle
       galloc.heap_mask = _NVMAP_HEAP_IOVMM
-      galloc.flags = _NVMAP_HANDLE_WRITE_COMBINE
+      galloc.flags = (_NVMAP_TAG_TINYGRAD << 16) | _NVMAP_HANDLE_WRITE_COMBINE
       galloc.align = 4096
       _tegra_ioctl(self._nvmap_fd, _NVMAP_IOC_ALLOC, galloc)
       ggetfd = _nvmap_create_handle()
@@ -924,7 +935,7 @@ class TegraIface:
       ualloc = _nvmap_alloc_handle()
       ualloc.handle = ucreate.handle
       ualloc.heap_mask = _NVMAP_HEAP_IOVMM
-      ualloc.flags = _NVMAP_HANDLE_WRITE_COMBINE
+      ualloc.flags = (_NVMAP_TAG_TINYGRAD << 16) | _NVMAP_HANDLE_WRITE_COMBINE
       ualloc.align = 4096
       _tegra_ioctl(self._nvmap_fd, _NVMAP_IOC_ALLOC, ualloc)
       ugetfd = _nvmap_create_handle()
@@ -1129,7 +1140,9 @@ class TegraIface:
     page_size = mmap.PAGESIZE
     size = round_up(size, page_size)
 
-    # Use inner cacheable for device memory, write-combine for uncached/host
+    # Use write-combine for uncached/host buffers, inner-cacheable for device memory.
+    # Note: cpu_access buffers (like kernargs_buf/QMD) also need write-combine for GPU coherence,
+    # but that's handled separately via uncached=True flag at allocation site, not here.
     cache_flags = _NVMAP_HANDLE_WRITE_COMBINE if (uncached or host) else _NVMAP_HANDLE_INNER_CACHEABLE
     if kwargs.get('cpu_cached'): cache_flags = _NVMAP_HANDLE_INNER_CACHEABLE
 
@@ -1143,7 +1156,7 @@ class TegraIface:
     alloc_args = _nvmap_alloc_handle()
     alloc_args.handle = handle
     alloc_args.heap_mask = _NVMAP_HEAP_IOVMM
-    alloc_args.flags = cache_flags
+    alloc_args.flags = (_NVMAP_TAG_TINYGRAD << 16) | cache_flags
     alloc_args.align = page_size
     alloc_args.numa_nid = 0
     _tegra_ioctl(self._nvmap_fd, _NVMAP_IOC_ALLOC, alloc_args)
@@ -1169,14 +1182,27 @@ class TegraIface:
       _tegra_ioctl(self._as_fd, _NVGPU_AS_IOCTL_MAP_BUFFER_EX, map_args)
       gpu_va = map_args.offset
 
-    # Step 5: mmap to CPU — always mmap on Tegra (unified memory)
+    # Step 5: mmap to CPU at the GPU VA address (unified VA)
+    # On Tegra with unified memory, we mmap the dmabuf at the same address as the GPU VA using MAP_FIXED.
+    # This means va_addr = GPU VA = CPU pointer, so code that uses va_addr as either works correctly.
+    # This mirrors how desktop NVK/UVM unifies the address space, but we achieve it explicitly via MAP_FIXED.
     import ctypes as ct
     libc_so = ct.CDLL("libc.so.6", use_errno=True)
     libc_so.mmap.restype = ct.c_void_p
     libc_so.mmap.argtypes = [ct.c_void_p, ct.c_size_t, ct.c_int, ct.c_int, ct.c_int, ct.c_long]
-    addr = libc_so.mmap(None, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, dmabuf_fd, 0)
-    if addr is None or addr == ct.c_void_p(-1).value or addr == 0xffffffffffffffff:
-      raise RuntimeError(f"TegraIface: mmap dmabuf_fd={dmabuf_fd} size={size} failed (errno={ct.get_errno()})")
+
+    if gpu_va != 0:
+      # Unified VA: mmap at the GPU VA address so va_addr works as both CPU pointer and GPU address
+      addr = libc_so.mmap(ct.c_void_p(gpu_va), size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED | MAP_FIXED, dmabuf_fd, 0)
+      if addr is None or addr == ct.c_void_p(-1).value or addr == 0xffffffffffffffff:
+        # Fallback: mmap at kernel-chosen address if MAP_FIXED at GPU VA fails
+        addr = libc_so.mmap(None, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, dmabuf_fd, 0)
+        if addr is None or addr == ct.c_void_p(-1).value or addr == 0xffffffffffffffff:
+          raise RuntimeError(f"TegraIface: mmap dmabuf_fd={dmabuf_fd} size={size} failed (errno={ct.get_errno()})")
+    else:
+      addr = libc_so.mmap(None, size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, dmabuf_fd, 0)
+      if addr is None or addr == ct.c_void_p(-1).value or addr == 0xffffffffffffffff:
+        raise RuntimeError(f"TegraIface: mmap dmabuf_fd={dmabuf_fd} size={size} failed (errno={ct.get_errno()})")
     view = MMIOInterface(addr, size, fmt='B')
 
     # Assign a fake hMemory handle for RM-style tracking used by NVDevice
@@ -1200,9 +1226,9 @@ class TegraIface:
         _tegra_ioctl(self._as_fd, _NVGPU_AS_IOCTL_UNMAP_BUFFER, unmap)
       except OSError: pass
 
-    # Unmap CPU view
-    if mem.view is not None:
-      try: FileIOInterface.munmap(int(mem.va_addr) if mem.view is None else mem.view._addr, mem.size)
+    # Unmap CPU view (use meta.cpu_addr which is the actual mmap return value)
+    if meta.cpu_addr:
+      try: FileIOInterface.munmap(meta.cpu_addr, meta.size)
       except Exception: pass
 
     # Close dmabuf fd
@@ -1289,6 +1315,9 @@ class NVDevice(HCQCompiled[NVSignal]):
        (functools.partial(NAKRenderer, self.arch, self.max_warps_per_sm), NV_NAK),
        (functools.partial(CUDARenderer, self.arch, use_nvcc=True), NV_NVCC)])
     super().__init__(device, NVAllocator(self), compilers, functools.partial(NVProgram, self), NVSignal, NVComputeQueue, NVCopyQueue)
+
+    # On Tegra, force pushbuffer-based signal release to avoid QMD reuse race (fast MMIO doorbell outpaces GPU QMD reads).
+    if self.is_tegra(): NVComputeQueue._tegra_signal = True
 
     self.pma_enabled = PMA.value > 0 and PROFILE >= 1 and not self.is_tegra()
     if self.pma_enabled: self._prof_init()
