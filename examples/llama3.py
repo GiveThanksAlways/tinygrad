@@ -185,6 +185,10 @@ MODEL_PARAMS = {
     "args": {"dim": 2048, "n_heads": 32, "n_kv_heads": 8, "n_layers": 16, "norm_eps": 1e-5, "rope_theta": 500000, "vocab_size": 128256, "hidden_dim": 8192},
     "files": 1
   },
+  "3B": {
+    "args": {"dim": 3072, "n_heads": 24, "n_kv_heads": 8, "n_layers": 28, "norm_eps": 1e-5, "rope_theta": 500000, "vocab_size": 128256, "hidden_dim": 8192},
+    "files": 1
+  },
   "8B": {
     "args": {"dim": 4096, "n_heads": 32, "n_kv_heads": 8, "n_layers": 32, "norm_eps": 1e-5, "rope_theta": 500000, "vocab_size": 128256, "hidden_dim": 14336},
     "files": 1
@@ -276,7 +280,7 @@ if __name__ == "__main__":
   parser = argparse.ArgumentParser()
   parser.add_argument("--download_model", action="store_true", help="Download a model")
   parser.add_argument("--model", type=Path, help="Model path")
-  parser.add_argument("--size", choices=["1B", "8B", "70B", "405B"], default="1B", help="Model size")
+  parser.add_argument("--size", choices=["1B", "3B", "8B", "70B", "405B"], default="1B", help="Model size")
   parser.add_argument("--shard", type=int, default=1, help="Shard the model across multiple devices")
   parser.add_argument("--quantize", choices=["int8", "nf4", "float16", "fp8"], help="Quantization method")
   parser.add_argument("--no_api", action="store_true", help="Disable the api and run a cli test interface")
