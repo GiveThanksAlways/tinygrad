@@ -119,7 +119,8 @@ class NVCommandQueue(HWQueue[HCQSignal, 'NVDevice', 'NVProgram', 'NVArgsState'])
       cmdq_wptr = (cmdq_addr - dev.cmdq_page.va_addr) // 4
       dev.cmdq[cmdq_wptr : cmdq_wptr + len(self._q)] = array.array('I', self._q)
 
-    gpfifo.ring[gpfifo.put_value % gpfifo.entries_count] = (cmdq_addr//4 << 2) | (len(self._q) << 42) | (1 << 41)
+    gpfifo_entry = (cmdq_addr//4 << 2) | (len(self._q) << 42) | (1 << 41)
+    gpfifo.ring[gpfifo.put_value % gpfifo.entries_count] = gpfifo_entry
     gpfifo.gpput[0] = (gpfifo.put_value + 1) % gpfifo.entries_count
 
     System.memory_barrier()
@@ -678,6 +679,10 @@ class _nvgpu_alloc_as_args(ctypes.Structure):
 class _nvgpu_as_bind_channel_args(ctypes.Structure):
   _fields_ = [("channel_fd", ctypes.c_uint32)]
 
+class _nvgpu_as_alloc_space_args(ctypes.Structure):
+  _fields_ = [("pages", ctypes.c_uint64), ("page_size", ctypes.c_uint32), ("flags", ctypes.c_uint32),
+              ("offset", ctypes.c_uint64), ("padding", ctypes.c_uint32 * 2)]
+
 class _nvgpu_as_map_buffer_ex_args(ctypes.Structure):
   _fields_ = [("flags", ctypes.c_uint32), ("compr_kind", ctypes.c_int16), ("incompr_kind", ctypes.c_int16),
               ("dmabuf_fd", ctypes.c_uint32), ("page_size", ctypes.c_uint32), ("buffer_offset", ctypes.c_uint64),
@@ -726,6 +731,7 @@ _NVMAP_IOC_ALLOC = _tegra_IOW('N', 3, ctypes.sizeof(_nvmap_alloc_handle))
 _NVMAP_IOC_GET_FD = _tegra_IOWR('N', 15, ctypes.sizeof(_nvmap_create_handle))
 _NVMAP_IOC_FREE = _tegra_IO('N', 4)
 _NVGPU_AS_IOCTL_BIND_CHANNEL = _tegra_IOWR('A', 1, ctypes.sizeof(_nvgpu_as_bind_channel_args))
+_NVGPU_AS_IOCTL_ALLOC_SPACE = _tegra_IOWR('A', 6, ctypes.sizeof(_nvgpu_as_alloc_space_args))
 _NVGPU_AS_IOCTL_MAP_BUFFER_EX = _tegra_IOWR('A', 7, ctypes.sizeof(_nvgpu_as_map_buffer_ex_args))
 _NVGPU_AS_IOCTL_UNMAP_BUFFER = _tegra_IOWR('A', 5, ctypes.sizeof(_nvgpu_as_unmap_buffer_args))
 _NVGPU_TSG_IOCTL_BIND_CHANNEL_EX = _tegra_IOWR('T', 11, ctypes.sizeof(_nvgpu_tsg_bind_channel_ex_args))
@@ -852,6 +858,20 @@ class TegraIface:
       args.va_range_split = 0
       _tegra_ioctl(self._ctrl_fd, _NVGPU_GPU_IOCTL_ALLOC_AS, args)
       self._as_fd = args.as_fd
+
+      # Reserve VA ranges for GPU memory windows to prevent the kernel VA allocator from assigning
+      # user buffer addresses that overlap with the shared_mem_window (0xFE00000000) or
+      # local_mem_window (0xFD00000000). Without this, large workloads (e.g. LLaMA inference)
+      # exhaust enough VA space that the kernel allocator places buffers in the window regions,
+      # causing GPU faults when the hardware intercepts those accesses as window operations.
+      for window_va in [0xFD00000000, 0xFE00000000]:
+        rsv = _nvgpu_as_alloc_space_args()
+        rsv.pages = 0x40000000 // mmap.PAGESIZE  # Reserve 1GB around each window
+        rsv.page_size = mmap.PAGESIZE
+        rsv.flags = 0x1  # NVGPU_AS_ALLOC_SPACE_FLAGS_FIXED_OFFSET
+        rsv.offset = window_va
+        _tegra_ioctl(self._as_fd, _NVGPU_AS_IOCTL_ALLOC_SPACE, rsv)
+
       self._handles[handle] = {"type": "virtmem", "as_fd": self._as_fd}
       return handle
 
@@ -1407,6 +1427,9 @@ class NVDevice(HCQCompiled[NVSignal]):
 
   def _ensure_has_local_memory(self, required):
     if self.slm_per_thread >= required: return
+
+    # Must synchronize before freeing the old shader_local_mem buffer — GPU may still be using it for in-flight kernels.
+    self.synchronize()
 
     self.slm_per_thread, old_slm_per_thread = round_up(required, 32), self.slm_per_thread
     bytes_per_tpc = round_up(round_up(self.slm_per_thread * 32, 0x200) * self.max_warps_per_sm * self.num_sm_per_tpc, 0x8000)
