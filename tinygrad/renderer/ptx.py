@@ -87,6 +87,25 @@ def render_wmma(ctx: "PTXRenderer", wmma: UOp):
 def modifier(a: DType, b: DType): return '.rzi' if dtypes.is_int(a) and dtypes.is_float(b) else '.rn' if dtypes.is_float(a) and \
   (a.itemsize < b.itemsize or dtypes.is_int(b) or b == dtypes.bool) else ''
 
+# NV/Tegra: decompose vector global loads/stores into scalar ops to avoid MISALIGNED_ADDR GPU exceptions.
+# On desktop CUDA, the driver installs a trap handler for misaligned vector accesses. On Tegra (nvgpu),
+# there is no trap handler—misaligned vector loads crash with SM machine check errors.
+# We use .volatile to prevent nvJitLink/ptxas from merging scalar loads back into vector SASS instructions.
+def _nv_decompose_load(ctx, x, loc, buf, gate=None):
+  mt, st, isz = mem_type(buf), ctx.mem_types[x.dtype.scalar()], x.dtype.scalar().itemsize
+  import sys; print(f"[NV_DECOMPOSE_LOAD] count={x.dtype.count} scalar={x.dtype.scalar()} mt={mt} st={st} isz={isz}", file=sys.stderr)
+  lines = []
+  if gate is not None:
+    lines.extend(f"mov.{st} {v}, {render_val(0, x.dtype.scalar())};" for v in ctx.r[x])
+  for i in range(x.dtype.count):
+    ld = f"ld.volatile.{mt}.{st} {ctx.r[x][i]}, [{ctx.r[loc]}+{i * isz}];"
+    lines.append(f"@{ctx.r[gate]} {ld}" if gate is not None else ld)
+  return lines
+
+def _nv_decompose_store(ctx, loc, var, buf):
+  mt, st, isz = mem_type(buf), ctx.mem_types[var.dtype.scalar()], var.dtype.scalar().itemsize
+  return [f"st.volatile.{mt}.{st} [{ctx.r[loc]}+{i * isz}], {ctx.r[var][i]};" for i in range(var.dtype.count)]
+
 string_rewrite = PatternMatcher([
   (UPat.cvar("x", dtypes.bool), lambda ctx, x: f"setp.ne.s16 {ctx.r[x]}, {render_val(x.arg, x.dtype)}, 0;"),
   (UPat.cvar("x"), lambda ctx, x: f"mov.b{ctx.types[x.dtype][1:]} {ctx.r[x]}, {render_val(x.arg, x.dtype)};"),
@@ -103,19 +122,26 @@ string_rewrite = PatternMatcher([
   (UPat(Ops.CAST, name="x", src=(UPat.var("a"),)),
    lambda ctx, x, a: f"cvt{modifier(x.dtype, a.dtype)}.{ctx.cast_types[x.dtype]}.{ctx.cast_types[a.dtype]} {ctx.r[x]}, {ctx.r[a]};"),
   # store / gated load / load
+  # NV/Tegra: vector global loads/stores are decomposed to scalar to prevent MISALIGNED_ADDR on non-power-of-2 strides (e.g. Q6_K 210-byte blocks)
   (UPat(Ops.STORE, src=(UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.var("loc")), allow_any_len=True), UPat.var("var"))),
-   lambda ctx, loc, var, buf: f"st.{mem_type(buf)}" + \
+   lambda ctx, loc, var, buf:
+    _nv_decompose_store(ctx, loc, var, buf) if var.dtype.count > 1 and ctx.device == "NV" and mem_type(buf) == 'global'
+    else f"st.{mem_type(buf)}" + \
     f"{f'.v{cnt}' if ((cnt:=var.dtype.count)>1) else ''}.{ctx.mem_types[var.dtype.scalar()]} " + \
     f"[{ctx.r[loc]}+0], {('{' + ', '.join(ctx.r[var]) + '}') if var.dtype.count > 1 else ctx.r[var]};"),
   (UPat(Ops.LOAD, name="x", src=(UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.var("loc"), UPat.var("gate"))), UPat.var("alt")), allow_any_len=True),
-    lambda ctx, x, loc, alt, gate, buf: flatten([
+    lambda ctx, x, loc, alt, gate, buf:
+    _nv_decompose_load(ctx, x, loc, buf, gate=gate) if alt.dtype.count > 1 and ctx.device == "NV" and mem_type(buf) == 'global'
+    else flatten([
     [f"mov.{ctx.mem_types[x.dtype.scalar()]} {v}, {render_val(0, x.dtype.scalar())};" for v in ctx.r[x]],
     [f"@{ctx.r[gate]} ld.{mem_type(buf)}.v{x.dtype.count}.{ctx.mem_types[x.dtype.scalar()]} {{{', '.join(ctx.r[x])}}}, [{ctx.r[loc]}+0];"]
   ]) if alt.dtype.count > 1 else [
     f"@{ctx.r[gate]} ld.{mem_type(buf)}.{ctx.mem_types[x.dtype.scalar()]} {ctx.r[x]}, [{ctx.r[loc]}+0];",
     f"@!{ctx.r[gate]} mov.b{ctx.types[x.dtype.scalar()][1:]} {ctx.r[x]}, {ctx.r[alt]};"]),
   (UPat(Ops.LOAD, name="x", src=(UPat(Ops.INDEX, src=(UPat.var("buf"), UPat.var("loc"))),), allow_any_len=True),
-    lambda ctx, x, loc, buf: f"ld.{mem_type(buf)}.v{x.dtype.count}.{ctx.mem_types[x.dtype.scalar()]} {{{', '.join(ctx.r[x])}}}, [{ctx.r[loc]}+0];" \
+    lambda ctx, x, loc, buf:
+    _nv_decompose_load(ctx, x, loc, buf) if x.dtype.count > 1 and ctx.device == "NV" and mem_type(buf) == 'global'
+    else f"ld.{mem_type(buf)}.v{x.dtype.count}.{ctx.mem_types[x.dtype.scalar()]} {{{', '.join(ctx.r[x])}}}, [{ctx.r[loc]}+0];" \
      if x.dtype.count > 1 else f"ld.{mem_type(buf)}.{ctx.mem_types[x.dtype]} {ctx.r[x]}, [{ctx.r[loc]}+0];"),
   # simple
   (UPat(Ops.DEFINE_REG, src=()), lambda ctx: []),
@@ -147,8 +173,13 @@ class PTXRenderer(Renderer):
   def __init__(self, arch:str, device="NV"):
     from tinygrad.runtime.support.compiler_cuda import NVPTXCompiler, PTXCompiler
     from tinygrad.runtime.support.hcq import MOCKGPU
-    self.compiler, self.device, self.arch = (PTXCompiler if bool(MOCKGPU) or device == "CUDA" else NVPTXCompiler)(arch), device, arch
+    # NV/Tegra (nvgpu): pass -O0 to nvJitLink to prevent ptxas from merging scalar loads into vector SASS (no trap handler for misaligned access)
+    tegra_opts = ("-O0",) if device == "NV" else ()
+    self.compiler = (PTXCompiler if bool(MOCKGPU) or device == "CUDA" else NVPTXCompiler)(arch, **(({"extra_opts": tegra_opts}) if tegra_opts else {}))
+    self.device, self.arch = device, arch
     self.tensor_cores = PTXRenderer.tc_sm80 if (ver:=int(arch[3:])) >= 80 else tc.cuda_sm75 if ver >= 75 else []
+    # NV/Tegra (nvgpu): no trap handler for misaligned vector accesses — disable vector loads/stores to prevent MISALIGNED_ADDR GPU faults
+    if device == "NV": self.supports_float4 = False
   def __reduce__(self): return self.__class__, (self.arch, self.device)
 
   # language options

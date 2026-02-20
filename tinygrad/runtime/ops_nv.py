@@ -1158,8 +1158,11 @@ class TegraIface:
   def alloc(self, size: int, host=False, uncached=False, cpu_access=False, contiguous=False,
             map_flags=0, cpu_addr=None, force_devmem=False, **kwargs) -> HCQBuffer:
     """Allocate GPU memory via nvmap: CREATE → ALLOC → GET_FD → MAP_BUFFER_EX → mmap."""
-    page_size = mmap.PAGESIZE
-    size = round_up(size, page_size)
+    # GPU page table page size is always 4KB on ga10b (big_page_size=0, available_big_page_sizes=0x0).
+    # For large device allocations, use larger nvmap alignment to improve physical contiguity and SMMU TLB efficiency.
+    page_size = mmap.PAGESIZE  # GPU MMU page size — always 4KB on Tegra ga10b
+    alloc_align = mmap.PAGESIZE if (uncached or host) else ((2 << 20) if size >= (8 << 20) else mmap.PAGESIZE)
+    size = round_up(size, alloc_align)
 
     # Use write-combine for uncached/host buffers, inner-cacheable for device memory.
     # Note: cpu_access buffers (like kernargs_buf/QMD) also need write-combine for GPU coherence,
@@ -1178,7 +1181,7 @@ class TegraIface:
     alloc_args.handle = handle
     alloc_args.heap_mask = _NVMAP_HEAP_IOVMM
     alloc_args.flags = (_NVMAP_TAG_TINYGRAD << 16) | cache_flags
-    alloc_args.align = page_size
+    alloc_args.align = alloc_align
     alloc_args.numa_nid = 0
     _tegra_ioctl(self._nvmap_fd, _NVMAP_IOC_ALLOC, alloc_args)
 
