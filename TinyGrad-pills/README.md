@@ -37,6 +37,9 @@ This collection of "pills" (inspired by [Nix Pills](https://nixos.org/guides/nix
 13. **[Pill 13: Machine Learning Primer](13-ml-primer.md)** — Training loop, layers, autograd, transformers in TinyGrad
 14. **[Pill 14: Contributing to TinyGrad](14-contributing.md)** — Repo structure, testing, debugging, code style
 
+### Cross-Framework Analysis
+15. **[Pill 15: Why TinyGrad Wins and Loses](15-why-tinygrad-wins-and-loses.md)** — First-principles breakdown of tinygrad vs llama.cpp, vLLM, MLC LLM on Orin
+
 ## Quick Reference
 
 ### Key Files by Function

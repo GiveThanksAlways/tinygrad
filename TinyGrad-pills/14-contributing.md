@@ -349,4 +349,5 @@ This prints the generated PTX — you can see exactly what GPU code your Python 
 ---
 
 **Previous**: [← Pill 13: Machine Learning Primer](13-ml-primer.md)
+**Next**: [Pill 15: Why TinyGrad Wins and Loses →](15-why-tinygrad-wins-and-loses.md)
 **Index**: [All Pills →](README.md)
