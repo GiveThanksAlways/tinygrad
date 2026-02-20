@@ -5,6 +5,7 @@ from tinygrad.runtime.autogen import nvrtc, nvjitlink as jitlink
 from tinygrad.device import Compiler, CompileError
 
 CUDA_PATH = getenv("CUDA_PATH", "")
+CUDA_INCLUDE_PATH = getenv("CUDA_INCLUDE_PATH", "")
 
 def _get_bytes(arg, get_str, get_sz, check) -> bytes:
   x = ctypes.create_string_buffer(init_c_var(ctypes.c_size_t, lambda x: check(get_sz(arg, ctypes.byref(x)))).value)
@@ -45,6 +46,7 @@ class NVRTCCompiler(Compiler):
   def __init__(self, arch:str, ptx=True, cache_key:str="cuda"):
     self.ptx, self.arch, self.compile_options = ptx, arch, [f'--gpu-architecture={arch}']
     self.compile_options += [f"-I{CUDA_PATH}/include"] if CUDA_PATH else ["-I/usr/local/cuda/include", "-I/usr/include", "-I/opt/cuda/include"]
+    if CUDA_INCLUDE_PATH: self.compile_options += [f"-I{CUDA_INCLUDE_PATH}"]
     nvrtc_check(nvrtc.nvrtcVersion((nvrtcMajor := ctypes.c_int()), (nvrtcMinor := ctypes.c_int())))
     if (nvrtcMajor.value, nvrtcMinor.value) >= (12, 4): self.compile_options.append("--minimal")
     super().__init__(f"compile_{cache_key}_{self.arch}")
