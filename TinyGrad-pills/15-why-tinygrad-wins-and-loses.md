@@ -63,7 +63,7 @@ Before we talk about frameworks, let's do the exact same math an LLM does — by
 
 Two vectors, same length. Multiply element-wise, sum:
 
-```
+```text
   a = [2, 3, 1]
   b = [4, 1, 5]
 
@@ -78,7 +78,7 @@ That's it. Every single computation in an LLM — attention, projections, feed-f
 
 Stack multiple dot products = matvec. This is what happens **every time the LLM generates one token**:
 
-```
+```text
   Weight matrix W (3×4):          Input vector x (4×1):
   ┌                    ┐          ┌     ┐
   │  0.5  -1.0  2.0  0.3 │       │  1.0 │
@@ -547,6 +547,496 @@ NV backend dispatch:    ~0.5 µs per kernel   ×  40 kernels = 20 µs overhead
 
 On a model where total compute is 25-40 ms per token, 200-600 µs is 0.5-2.4% overhead. Seems small? It's actually the difference between winning and losing against llama.cpp.
 
+### Know Your Hardware: The Jetson Orin AGX SoC
+
+Before we dive into GPU internals, let's understand the *specific* chip we're running on. The Jetson AGX Orin is not a desktop GPU bolted onto a board — it's a **System-on-Chip (SoC)** that packs an entire computer onto one die, designed from the ground up for robotics, autonomous vehicles, and edge AI.
+
+#### The Full SoC Block Diagram
+
+```
+┌─────────────────────────────── Jetson AGX Orin 64GB ───────────────────────────────┐
+│                                                                                     │
+│  ┌─────────────────────────── Ampere GPU (cut-down) ───────────────────────────┐   │
+│  │  2048 CUDA Cores (FP32)   │   64 Tensor Cores (3rd gen)                     │   │
+│  │  16 Streaming Multiprocessors (SMs)                                         │   │
+│  │  SM 8.7 (Ampere variant, not full GA100/GA102)                              │   │
+│  │  Peak FP16 Tensor: 5.3 TFLOPS  │  Peak FP32: 2.6 TFLOPS (non-Tensor)      │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  ┌──────────── CPU ─────────────┐  ┌─────────── DLA ──────────────────────────┐   │
+│  │  12-core Arm Cortex-A78AE    │  │  2× Deep Learning Accelerators (DLA)     │   │
+│  │  (Armv8.2-A, 64-bit)        │  │  INT8: up to 170 TOPs combined           │   │
+│  │  3 clusters × 4 cores       │  │  Separate from GPU — runs INT8 models    │   │
+│  │  2 MB L2 per cluster         │  │  at ultra-low power for always-on AI     │   │
+│  │  Up to 2.2 GHz              │  └───────────────────────────────────────────┘   │
+│  └──────────────────────────────┘                                                   │
+│                                                                                     │
+│  ┌──────────── Video ───────────┐  ┌─────────── Vision ───────────────────────┐   │
+│  │  1× NVENC (H.265 encoder)   │  │  PVA v2.0 (Programmable Vision Accel.)   │   │
+│  │  1× NVDEC (H.265/AV1)      │  │  Stereo depth, optical flow              │   │
+│  └──────────────────────────────┘  └───────────────────────────────────────────┘   │
+│                                                                                     │
+│  ┌─────────────────────────── Memory Subsystem ───────────────────────────────┐   │
+│  │  64 GB LPDDR5 — UNIFIED (shared between CPU + GPU + DLA, no separate      │   │
+│  │  VRAM!)                                                                     │   │
+│  │  256-bit bus  ×  LPDDR5-6400  =  204.8 GB/s peak bidirectional             │   │
+│  │  Realistic read bandwidth: ~102 GB/s (half-duplex read bottleneck)          │   │
+│  │  4 MB L3 system cache (shared)                                              │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+│  ┌─────────── I/O ──────────────────────────────────────────────────────────┐     │
+│  │  PCIe Gen 4 (×8 + ×4)  │  10GbE  │  CAN  │  UART  │  USB 3.2  │  HDMI  │     │
+│  └──────────────────────────────────────────────────────────────────────────┘     │
+│                                                                                     │
+│  TDP: 15W – 60W (configurable via nvpmodel)                                       │
+│  Process: Samsung 8nm                                                               │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+That's a LOT of stuff on one chip. For LLM inference, we primarily care about the **GPU** and the **memory subsystem**. But the DLAs, video encoders, and vision accelerators are why this chip exists — it's a *robotics computer*, not a GPU that happens to have a CPU.
+
+#### Orin vs Datacenter: Not a Toy, But a Different Animal
+
+Here's how the Orin stacks up against datacenter and desktop GPUs:
+
+```
+┌─────────────────┬────────────┬────────────┬────────────┬────────────┐
+│                  │ Orin AGX   │ RTX 4090   │ A100 80GB  │ H100 SXM   │
+│                  │ 64GB       │ (Ada)      │ (Ampere)   │ (Hopper)   │
+├─────────────────┼────────────┼────────────┼────────────┼────────────┤
+│ CUDA Cores      │     2,048  │    16,384  │     6,912  │    14,592  │
+│ Tensor Cores    │        64  │       512  │       432  │       528  │
+│ SMs             │        16  │       128  │       108  │       132  │
+│ Memory          │  64 GB     │  24 GB     │  80 GB     │  80 GB     │
+│                 │  LPDDR5    │  GDDR6X    │  HBM2e     │  HBM3      │
+│ BW (GB/s)       │      ~102  │     1,008  │     2,039  │     3,350  │
+│ FP16 Tensor TF  │     5.3    │      330   │       312  │       990  │
+│ TDP (Watts)     │    15–60   │       450  │       300  │       700  │
+│ $/unit (approx) │    ~$2,000 │   ~$1,600  │  ~$15,000  │  ~$30,000  │
+│ Form factor     │ 100×87mm   │ PCIe slot  │ PCIe/SXM   │ SXM5       │
+│                 │ module     │            │            │            │
+└─────────────────┴────────────┴────────────┴────────────┴────────────┘
+```
+
+The ratios tell the story:
+
+```
+Orin vs A100 (the comparison that matters for understanding):
+
+  CUDA Cores:    2,048 / 6,912  =  29.6%   (roughly a third)
+  Tensor Cores:     64 / 432    =  14.8%   (about 15%)
+  Memory BW:       102 / 2,039  =   5.0%   (one twentieth!)
+  FP16 TFLOPS:     5.3 / 312    =   1.7%   (less than 2%)
+  TDP:              60 / 300    =  20.0%   (one fifth the power)
+
+  But: 64 GB unified memory vs 80 GB — only 20% less capacity!
+```
+
+**The Orin has roughly a third of the CUDA cores and about 15% of the Tensor Cores of an A100.** Not a toy — but the compute ceiling is much lower, which fundamentally changes which operations are compute-bound vs memory-bound.
+
+#### Why the Bandwidth Ratio Changes Everything
+
+On a datacenter A100, a matmul like `[2048, 2048] × [2048, 2048]` is compute-bound — there's enough arithmetic (2048³ × 2 = 17.2 billion FLOPs) to keep the GPU busy while data streams from HBM.
+
+On the Orin, that **same matmul might be memory-bound**, because:
+
+```
+By hand — Compute vs Memory for [2048, 2048] × [2048, 2048] matmul:
+
+  FLOPs needed:     2 × 2048³ = 17.18 billion FLOPs
+  Data to read:     2 × 2048² × 2 bytes (fp16) = 16.78 MB
+  Data to write:    2048² × 2 bytes = 8.39 MB
+  Total traffic:    ~25 MB
+
+  A100:
+    Compute time:  17.18 GFLOP / 312 TFLOPS = 0.055 ms
+    Memory time:   25 MB / 2,039 GB/s        = 0.012 ms
+    → Compute-bound (compute takes 4.5× longer than memory)
+    → Arithmetic intensity: 17.18 GF / 0.025 GB = 687 FLOP/byte
+
+  Orin:
+    Compute time:  17.18 GFLOP / 5.3 TFLOPS  = 3.24 ms
+    Memory time:   25 MB / 102 GB/s           = 0.245 ms
+    → Still compute-bound, but ratio is 13:1 not 4.5:1
+
+  Now consider MATVEC [2048, 2048] × [2048, 1]:
+    FLOPs needed:  2 × 2048² = 8.39 million
+    Data to read:  2048² × 2 bytes = 8.39 MB (the weight matrix dominates)
+
+  A100:
+    Compute time:  8.39 MFLOP / 312 TFLOPS   = 0.000027 ms
+    Memory time:   8.39 MB / 2,039 GB/s       = 0.004 ms
+    → Memory-bound (memory is 150× slower than compute)
+
+  Orin:
+    Compute time:  8.39 MFLOP / 5.3 TFLOPS   = 0.0016 ms
+    Memory time:   8.39 MB / 102 GB/s         = 0.082 ms
+    → Memory-bound (memory is 51× slower than compute)
+```
+
+Key insight: **On the Orin, even more operations are memory-bound than on a datacenter GPU.** This is actually *good* for frameworks like tinygrad that optimize memory access patterns (NV backend, fp16 dequant at load time) rather than relying on hand-tuned GEMM kernels.
+
+#### Unified Memory: No PCIe, No Copies
+
+One of the Orin's biggest architectural differences:
+
+```
+Datacenter GPU (A100):
+  ┌────────┐                      ┌────────────────────┐
+  │  CPU   │ ← PCIe Gen 4 ×16 → │       GPU           │
+  │ DDR5   │    ~32 GB/s          │  HBM2e (80 GB)     │
+  │ 512 GB │    bottleneck!       │  2,039 GB/s local   │
+  └────────┘                      └────────────────────┘
+  To load a model: CPU reads file → copies over PCIe → GPU VRAM
+  Loading LLaMA 3B fp16: 6 GB / 32 GB/s = 0.19s (PCIe transfer alone)
+
+Jetson Orin:
+  ┌────────────────────────────────────────────────┐
+  │  CPU cores      GPU cores      DLA cores       │
+  │       ↕              ↕              ↕           │
+  │  ┌────────────────────────────────────────┐    │
+  │  │       LPDDR5 — 64 GB (unified)         │    │
+  │  │       ONE pool, everyone shares it      │    │
+  │  │       No PCIe copy needed!              │    │
+  │  └────────────────────────────────────────┘    │
+  └────────────────────────────────────────────────┘
+  To load a model: CPU reads file → it's already in GPU-accessible memory
+  Zero-copy for mmap'd model files (GGUF, safetensors)
+```
+
+**Unified memory means:**
+- No `cudaMemcpy()` host-to-device transfers — the GPU reads directly from the same DRAM
+- Model loading via `mmap()` means the first kernel access pulls data from disk/pagecache, no staging buffer needed
+- CPU and GPU can work on the same buffer without explicit synchronization (though cache coherence has costs)
+- More memory available for models — the full 64 GB is usable by both CPU and GPU
+
+The downside: total bandwidth to that unified pool is ~102 GB/s read, shared by **everything** — CPU, GPU, DLA, video codecs. In practice, LLM inference is GPU-dominant so contention is minimal.
+
+#### Power Consumption: Why This Chip Exists
+
+The Orin was designed for **autonomous vehicles, robots, drones, and medical devices** — systems that can't afford 300W+ GPUs with liquid cooling and server racks:
+
+```
+Power profiles (configurable via nvpmodel):
+
+  MODE 0 (MAXN):     CPU: all 12 cores @ 2.2 GHz
+                      GPU: 1300 MHz
+                      TDP: ~60W
+                      → Maximum performance. Use this for benchmarks.
+
+  MODE 1 (50W):      CPU: all 12 cores @ 2.2 GHz
+                      GPU: 1300 MHz
+                      TDP: 50W (thermal-throttled)
+
+  MODE 2 (30W):      CPU: 8 cores @ 1.5 GHz
+                      GPU: 930 MHz
+                      TDP: ~30W
+                      → Sweet spot for 24/7 robots
+
+  MODE 3 (15W):      CPU: 4 cores @ 1.2 GHz
+                      GPU: 510 MHz
+                      TDP: ~15W
+                      → Battery-powered drones, portable devices
+
+  Check current mode:   sudo nvpmodel -q
+  Switch mode:          sudo nvpmodel -m 0    (MODE 0 = MAXN)
+  Show clocks:          sudo jetson_clocks --show
+  Lock max clocks:      sudo jetson_clocks     (pins to max within TDP)
+```
+
+**Perf-per-watt comparison** — LLM decode on LLaMA 1B fp16:
+
+```
+  Orin AGX (60W):    29 tok/s   → 0.483 tok/s/W
+  RTX 4090 (450W):   ~300 tok/s → 0.667 tok/s/W   (estimated)
+  A100 (300W):       ~250 tok/s → 0.833 tok/s/W   (estimated)
+
+  But: can an A100 fit inside a robot arm? Can it run on a 72Wh battery?
+
+  Orin at 30W:       ~18 tok/s  → 0.600 tok/s/W   (better perf/watt!)
+  Orin at 15W:       ~8 tok/s   → 0.533 tok/s/W   (still running inference)
+
+  A robot running Qwen3 0.6B at 15W for real-time path-planning?
+  That's the use case. Not beating an H100 on throughput.
+```
+
+#### The Ampere Cut-Down: What's Missing?
+
+The Orin GPU is based on NVIDIA's Ampere architecture (same family as A100 and RTX 3090), but is the "GA10B" — a cut-down mobile variant:
+
+```
+Full Ampere (A100 GA100):         Orin (GA10B):
+  108 SMs                           16 SMs
+  6912 CUDA Cores                   2048 CUDA Cores
+  432 Tensor Cores (3rd gen)        64 Tensor Cores (3rd gen)
+  40 MB L2 Cache                    4 MB L3 + 3.6 MB SMEM
+  HBM2e (separate)                  LPDDR5 (unified)
+  NVLink for multi-GPU              No NVLink
+  FP64 support (half-rate)          FP64 support (minimal)
+  MIG (multi-instance GPU)          No MIG
+  TF32 datatype                     TF32 datatype ✓
+  Sparsity (2:4 structured)         Sparsity (2:4 structured) ✓
+```
+
+**What Orin keeps from Ampere:**
+- **3rd-gen Tensor Cores** — same instruction set, just fewer of them. Tensor matmul runs the same WMMA instructions
+- **SM 8.7** — nearly identical to SM 8.0 (A100). Same warp size (32), same shared memory per SM (up to 228 KB configurable), same register file (256 KB per SM)
+- **TF32** — can accelerate fp32 workloads with implicit down-round (not relevant for LLMs, but useful for training)
+- **2:4 structured sparsity** — hardware-accelerated 50% sparse matmuls (doubles effective Tensor Core throughput)
+- **PTX/SASS compatibility** — CUDA code compiled for SM 8.x runs on both A100 and Orin without recompilation
+
+**What's different in practice for LLM inference:**
+- 16 SMs means fewer concurrent warps → occupancy mattered less, memory latency hiding is harder
+- ~102 GB/s vs ~2,039 GB/s memory bandwidth is the **dominant** bottleneck
+- No NVLink means no multi-GPU inference (only one GPU on the SoC)
+- Unified memory eliminates host↔device copy overhead but caps total BW
+
+#### What Does This Mean for tinygrad?
+
+```
+On a datacenter GPU, you optimize for:
+  1. COMPUTE — use Tensor Cores, maximize TFLOPS
+  2. Memory BW comes "for free" with HBM (2+ TB/s)
+  3. Multi-GPU scaling via NVLink
+  4. Batch for throughput
+
+On the Orin, you optimize for:
+  1. MEMORY BANDWIDTH — it's the bottleneck for everything
+  2. Dispatch overhead — 102 GB/s means a 40ms decode window; 
+     wasting 0.6ms on dispatch = 1.5% of your budget
+  3. Data format — fp16 (2 bytes) vs Q6_K (0.82 bytes) = 2.4× less BW pressure
+  4. Kernel fusion — fewer DRAM round-trips = more of that 102 GB/s budget
+     goes to useful work
+
+  That's why NV backend (low dispatch) + good memory access patterns
+  matter MORE on Orin than on an A100.
+```
+
+This is the hardware context for every benchmark number in this pill. When we say "29 tok/s on LLaMA 1B", we're talking about pushing 2 GB of weights through 102 GB/s of memory bandwidth, 29 times per second, on a chip that sips 60 watts and fits in the palm of your hand.
+
+### GPU Internals: Warps, Coalescing, Shared Memory (by Hand)
+
+To understand *why* some kernels are fast and others are slow, you need to understand how a GPU actually executes. This is the hardware that makes or breaks your tok/s.
+
+#### The Thread Hierarchy
+
+```
+Grid (1 kernel launch)
+  └── Block 0                    Block 1                   Block 2 ...
+       └── Warp 0 (threads 0-31)  Warp 0 (threads 0-31)   ...
+           Warp 1 (threads 32-63) Warp 1 (threads 32-63)
+           Warp 2 (threads 64-95) ...
+           ...
+```
+
+**Warp = 32 threads that execute in lockstep.** This is the atomic unit of execution on NVIDIA GPUs. All 32 threads run the SAME instruction at the SAME time, just on different data (SIMT — Single Instruction, Multiple Threads).
+
+```
+A warp executing matvec (32 threads cooperating on one row):
+
+  Clock 1:  all 32 threads execute LOAD (each loads one weight from DRAM)
+  Clock 2:  all 32 threads execute MUL  (each multiplies weight × input)
+  Clock 3:  all 32 threads execute ADD  (partial sum reduction)
+  ...
+  ┌────────────────────────────────────────────────────────────────┐
+  │ T0  │ T1  │ T2  │ T3  │ ... │ T30 │ T31 │ ← 32 threads      │
+  │LD   │ LD  │ LD  │ LD  │     │ LD  │ LD  │ ← same instruction │
+  │w[0] │w[1] │w[2] │w[3] │     │w[30]│w[31]│ ← different data   │
+  └────────────────────────────────────────────────────────────────┘
+```
+
+**Warp divergence** — what happens with `if/else`:
+
+```
+  if (thread_id < 16):    ← only 16 threads take this branch
+      do_something()      ← GPU executes this with 32 threads, but 16 are masked off
+  else:
+      do_other()          ← GPU executes this with 32 threads, but other 16 masked off
+
+  Result: BOTH branches execute serially → 2× slowdown!
+  tinygrad avoids this: generated kernels rarely have data-dependent branches.
+```
+
+#### Orin's SM Layout (Streaming Multiprocessor)
+
+```
+Orin AGX 64GB: 16 SMs, each with:
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  SM (Streaming Multiprocessor)                                   │
+  │                                                                  │
+  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐           │
+  │  │ Warp     │ │ Warp     │ │ Warp     │ │ Warp     │           │
+  │  │Scheduler │ │Scheduler │ │Scheduler │ │Scheduler │  4 sched  │
+  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘           │
+  │                                                                  │
+  │  ┌──────────────────────────────────────────────────────────┐   │
+  │  │   128 CUDA cores (FP32)  /  64 FP64  /  4 Tensor Cores  │   │
+  │  └──────────────────────────────────────────────────────────┘   │
+  │                                                                  │
+  │  ┌──────────────────────────────────────────────────────────┐   │
+  │  │   Register File: 256 KB (65,536 × 32-bit registers)      │   │
+  │  └──────────────────────────────────────────────────────────┘   │
+  │                                                                  │
+  │  ┌──────────────────────────────────────────────────────────┐   │
+  │  │   Shared Memory / L1 Cache: 228 KB (configurable split)  │   │
+  │  └──────────────────────────────────────────────────────────┘   │
+  │                                                                  │
+  │  Max 48 warps (1536 threads) active simultaneously              │
+  │  Max 32 blocks can be resident at once                          │
+  └──────────────────────────────────────────────────────────────────┘
+
+  16 SMs × 128 cores = 2048 CUDA cores total
+  16 SMs × 256 KB registers = 4 MB register file total
+  16 SMs × 228 KB SMEM = 3.6 MB on-chip SRAM total
+```
+
+**4 warp schedulers per SM**: Every clock cycle, each scheduler picks one of its ~12 resident warps and issues an instruction. When a warp is waiting for a DRAM load (300+ cycles), the scheduler switches to another warp instantly (zero-cost context switch). This is how GPUs hide memory latency — they don't wait, they switch.
+
+#### Memory Coalescing (Why Access Patterns Matter)
+
+When 32 threads in a warp load memory, the GPU groups their addresses into **128-byte cache line requests**. If all 32 threads load consecutive addresses, it's one request. If they load scattered addresses, it can be up to 32 separate requests:
+
+```
+COALESCED (good — 1 transaction):
+  Thread 0 loads addr 0x1000    ┐
+  Thread 1 loads addr 0x1002    │  All within one 128-byte cache line
+  Thread 2 loads addr 0x1004    │  0x1000–0x107F
+  ...                           │
+  Thread 31 loads addr 0x103E   ┘
+  → GPU issues ONE 128-byte read from DRAM
+
+STRIDED (bad — multiple transactions):
+  Thread 0 loads addr 0x1000    → cache line 0x1000
+  Thread 1 loads addr 0x2000    → cache line 0x2000  (different!)
+  Thread 2 loads addr 0x3000    → cache line 0x3000  (different!)
+  ...
+  Thread 31 loads addr 0x20000  → cache line 0x20000
+  → GPU issues 32 SEPARATE 128-byte reads! 32× more traffic!
+
+  Effective bandwidth:
+    Coalesced: 32 × 2 bytes useful / 128 bytes read = 50% efficient (minimum)
+    Strided:   32 × 2 bytes useful / 32×128 bytes read = 1.6% efficient!
+```
+
+**By hand — weight matrix access pattern for matvec**:
+
+```
+  Weight W stored in ROW-MAJOR order in memory:
+  addr: 0x0000  0x0002  0x0004  0x0006  0x0008  0x000A  ...
+  data: W[0,0]  W[0,1]  W[0,2]  W[0,3]  W[0,4]  W[0,5]  ...
+        W[1,0]  W[1,1]  W[1,2]  ...     (next row starts at 0 + K*2)
+
+  GOOD: 32 threads read consecutive elements of the SAME row
+    T0→W[0,0]  T1→W[0,1]  T2→W[0,2] ... T31→W[0,31]  ← coalesced!
+
+  BAD: 32 threads each read one element from DIFFERENT rows
+    T0→W[0,0]  T1→W[1,0]  T2→W[2,0] ... T31→W[31,0]  ← stride = K*2 bytes!
+    If K=2048 → stride = 4096 bytes → each thread hits a different cache line
+```
+
+This is exactly why tinygrad's matvec heuristic uses `MV_THREADS_PER_ROW=32` — it makes 32 threads cooperate along the K dimension of one row, giving coalesced reads.
+
+#### Shared Memory Bank Conflicts (the Hidden Bottleneck)
+
+Shared memory (SRAM) on each SM is divided into **32 banks**, one per thread in a warp. Each bank can serve one address per cycle:
+
+```
+Shared memory banks (32 banks, 4-byte width each):
+  Bank 0:  addr 0, 128, 256, ...
+  Bank 1:  addr 4, 132, 260, ...
+  Bank 2:  addr 8, 136, 264, ...
+  ...
+  Bank 31: addr 124, 252, 380, ...
+
+  Address → Bank mapping:  bank = (addr / 4) % 32
+```
+
+**No conflict (all threads hit different banks)** — 1 cycle:
+
+```
+  T0 → Bank 0    T1 → Bank 1    T2 → Bank 2  ...  T31 → Bank 31
+  All 32 accesses complete in 1 cycle. Full bandwidth.
+```
+
+**2-way bank conflict (two threads hit the same bank)** — 2 cycles:
+
+```
+  T0 → Bank 0    T1 → Bank 0 ← CONFLICT!    T2 → Bank 2 ...
+  Must serialize: T0 goes first, then T1. Takes 2 cycles instead of 1.
+```
+
+**32-way bank conflict (all threads hit the same bank)** — 32 cycles:
+
+```
+  T0 → Bank 0    T1 → Bank 0    T2 → Bank 0  ...  T31 → Bank 0
+  32× slowdown! Each thread waits in line.
+  This happens when stride between accesses is a multiple of 32×4 = 128 bytes.
+```
+
+tinygrad currently doesn't explicitly manage bank conflicts — the heuristic focuses on DRAM coalescing, which matters more for memory-bound LLM decode. But for compute-bound workloads (CNNs, prefill with large batch), bank conflicts can cause 2-4× slowdowns in shared memory-heavy kernels.
+
+#### Occupancy: How Many Warps Can Run?
+
+**Occupancy** = fraction of maximum warps that are actually resident on an SM. Higher occupancy = more warps to switch between when one is waiting on memory = better latency hiding.
+
+Each SM can hold up to 48 warps, but **three resources** limit how many actually fit:
+
+```
+Resource limits per SM (Orin, SM 8.7):
+  Max warps:     48
+  Max blocks:    32
+  Registers:     65,536
+  Shared memory: 228 KB
+
+Example kernel: 256 threads/block, 32 registers/thread, 4 KB shared mem/block:
+  Warps per block: 256/32 = 8
+  Register limit:  65,536 / (8×32 × 32) = 65,536 / 8,192 = 8 blocks → 64 warps
+                   But max 48 warps, so: 48/8 = 6 blocks → 48 warps
+  SMEM limit:      228 KB / 4 KB = 57 blocks → no bottleneck
+  Block limit:     32 blocks → no bottleneck
+
+  Occupancy: min(48, 48, unlimited, unlimited) = 48 warps = 100%
+
+Example kernel: 256 threads/block, 64 registers/thread, 48 KB shared mem/block:
+  Register limit:  65,536 / (8 × 64) = 128 warps → 16 blocks → 48 warps (cap)
+                   Wait: 8 warps × 64 regs × 32 threads = 16,384 regs per block
+                   65,536 / 16,384 = 4 blocks → 32 warps
+  SMEM limit:      228 KB / 48 KB = 4 blocks → 32 warps
+
+  Occupancy: min(32, 32) = 32 warps = 67%
+```
+
+For memory-bound matvec, occupancy matters less because the bottleneck is DRAM bandwidth, not latency hiding. But for compute-bound prefill kernels or CNN training, low occupancy can tank performance. tinygrad's BEAM search implicitly optimizes for occupancy by trying different thread/block configs.
+
+#### Warp Shuffle: Intra-Warp Communication Without Shared Memory
+
+Warps have a special trick: threads can exchange data with each other **without going through shared memory**:
+
+```
+Warp shuffle: shfl.sync (built into the hardware)
+
+  Before shfl:  T0=3.0  T1=1.5  T2=4.2  T3=0.8 ... T31=2.1
+  
+  shfl.down.sync by 1:
+    T0 gets T1's value → 1.5
+    T1 gets T2's value → 4.2
+    T2 gets T3's value → 0.8
+    ...
+
+  Used for: tree reduction (sum 32 values in 5 steps):
+    Step 1: add values from lane+16  (32→16 partial sums)
+    Step 2: add values from lane+8   (16→8 partial sums)
+    Step 3: add values from lane+4   (8→4)
+    Step 4: add values from lane+2   (4→2)
+    Step 5: add values from lane+1   (2→1) → final sum in lane 0!
+
+  log₂(32) = 5 steps. No shared memory needed. ~5 cycles total.
+```
+
+tinygrad uses warp shuffle for reductions in matvec — the 32 threads cooperating on a row reduce their partial sums via shuffle, avoiding shared memory bank conflicts entirely.
+
+
+
 ### What is the NV Backend (HCQ)?
 
 tinygrad's NV backend bypasses the entire CUDA software stack:
@@ -608,17 +1098,35 @@ tinygrad has two ways to optimize its generated kernels:
 
 **BEAM search** (`search.py`): Try hundreds of kernel configurations on real hardware, time them, keep the best. Runs in seconds per kernel. Opt-in via `BEAM=N`.
 
-On Jetson Orin, BEAM is **counterproductive** for LLM decode:
+**Critical distinction: BEAM vs JITBEAM** — these are NOT the same:
 
-| Config            |  tok/s   | Why                                                                       |
-| ----------------- | :------: | ------------------------------------------------------------------------- |
-| Default heuristic | **29.0** | Well-tuned rules for Orin's memory system                                 |
-| JITBEAM=2         |   1.0    | 27× slower! Beam finds locally-optimal kernels that cause cache thrashing |
-| JITBEAM=4         |   1.1    | Same disaster                                                             |
+```
+BEAM=N (offline, cached to disk):
+  1. Run once with BEAM=2 → searches for good kernels → saves to disk cache
+  2. Subsequent runs load cached kernels → no search overhead
+  3. Pill 12 reports 36.71 tok/s with BEAM cached (Qwen3 1B Q6_K, older measurement)
+  4. Works because the cached kernels were validated in isolation
 
-**Root cause**: BEAM optimizes each kernel independently. It finds thread/block configs that minimize single-kernel time. But on Orin's unified memory (shared LPDDR5, no dedicated VRAM), these "optimal" configs cause inter-kernel cache thrashing that destroys overall pipeline throughput.
+JITBEAM=N (live, searches during inference):
+  1. Every JIT call triggers a fresh BEAM search over all kernels
+  2. Search takes seconds → drags inference to ~1 tok/s
+  3. Even after search completes, the "optimal" kernels cause
+     cache thrashing on Orin's unified memory
+  4. NEVER use JITBEAM for LLM decode on Orin
+```
+
+| Config | tok/s | Model | What's happening |
+|--------|:---:|-------|---------|
+| Default heuristic | **29.0** | LLaMA 1B Q6_K | Well-tuned rules for Orin's memory system |
+| BEAM cached (from Pill 12) | 36.71 | Qwen3 1B Q6_K | Pre-searched kernels, older measurement, favorable caching |
+| JITBEAM=2 (live) | 1.0 | LLaMA 1B Q6_K | 27× slower! Search overhead + cache thrashing |
+| JITBEAM=4 (live) | 1.1 | LLaMA 1B Q6_K | Same disaster |
+
+**Root cause for JITBEAM failure**: BEAM optimizes each kernel independently. It finds thread/block configs that minimize single-kernel time. But on Orin's unified memory (shared LPDDR5, no dedicated VRAM), these "optimal" configs cause inter-kernel cache thrashing that destroys overall pipeline throughput.
 
 The heuristic works better because it applies consistent patterns (same thread counts, same memory access strategy) across all kernels, keeping the cache warm.
+
+**Note on the 36.71 tok/s number** (from [Pill 12](12-benchmarking.md)): That was measured with a pre-populated BEAM disk cache on Qwen3 1B Q6_K. The number is real but: (a) it uses a different model size than our LLaMA 1B benchmarks, and (b) the disk-cached BEAM kernels were found before the matvec heuristic fix, so the comparison baseline was much lower. Our current best with the heuristic is 29.0 tok/s on LLaMA 1B Q6_K and 41.0 tok/s on Qwen3 0.6B.
 
 See [Pill 7](07-beam-search.md) for the full BEAM deep-dive.
 
@@ -1014,6 +1522,200 @@ The first 3-4 lines are JIT warmup (slow). Steady-state is lines 5+.
 
 ---
 
+## Part 7: tinygrad Internals That Matter for Performance
+
+### ShapeTracker: How tinygrad Avoids Memory Copies
+
+When you reshape, transpose, or slice a tensor, most frameworks copy data to a new layout. tinygrad does **zero copies** — it just changes the metadata about how to interpret the underlying buffer:
+
+```
+Original tensor: shape=(2,3), strides=(3,1)
+  Memory layout: [a b c d e f]
+
+  Accessing [i,j] → memory offset = i*3 + j*1
+  [0,0]=a  [0,1]=b  [0,2]=c
+  [1,0]=d  [1,1]=e  [1,2]=f
+
+Transposed: shape=(3,2), strides=(1,3)  ← NO COPY, just swap strides!
+  Same memory: [a b c d e f]
+
+  Accessing [i,j] → memory offset = i*1 + j*3
+  [0,0]=a  [0,1]=d     ← rows of transpose = columns of original
+  [1,0]=b  [1,1]=e
+  [2,0]=c  [2,1]=f
+
+Reshaped to (6,): shape=(6,), strides=(1,)  ← still NO COPY!
+  Same memory: [a b c d e f]
+  [0]=a  [1]=b  [2]=c  [3]=d  [4]=e  [5]=f
+
+Sliced [0:2, 1:3]: shape=(2,2), strides=(3,1), offset=1  ← NO COPY!
+  Same memory: [a b c d e f]
+                   ^       starts at b (offset=1)
+  [0,0]=b  [0,1]=c
+  [1,0]=e  [1,1]=f
+```
+
+The **ShapeTracker** chains these "views" together. Each view is `(shape, strides, offset, mask)`. When tinygrad finally compiles the kernel, it generates index arithmetic that walks the original buffer using the combined strides:
+
+```python
+# What the compiled kernel index looks like (simplified):
+for global_idx in range(output_size):
+    # ShapeTracker generates this addressing:
+    i = global_idx // output_stride_0
+    j = global_idx % output_stride_0
+    src_offset = i * src_stride_0 + j * src_stride_1 + base_offset
+    output[global_idx] = input[src_offset]
+```
+
+**Why this matters for LLM speed**: Attention involves multiple reshapes and transposes (splitting into heads, permuting dims). With ShapeTracker, these are free — zero DRAM traffic. Only the actual matrix multiplies touch memory.
+
+### TinyJit: Capturing and Replaying Kernel Sequences
+
+`@TinyJit` records the sequence of GPU kernels from the first call, then replays them on subsequent calls — skipping all Python-level scheduling, lowering, and compilation:
+
+```python
+@TinyJit
+def generate_token(model, x, cache):
+    return model(x, cache)  # triggers ~40 GPU kernels
+
+# First call: full pipeline
+#   Python → Schedule → Lower → Render → Compile → Execute
+#   Time: ~500ms (JIT compilation + execution)
+
+# Second call: replay
+#   Python → Execute (replay recorded kernel sequence)
+#   Time: ~34ms (just GPU execution!)
+
+# All subsequent calls: same fast replay
+```
+
+```
+Without TinyJit:
+  ┌────────┐ ┌──────────┐ ┌───────┐ ┌────────┐ ┌─────────┐ ┌─────────┐
+  │Schedule │→│ Lower    │→│Render │→│Compile │→│         │→│         │
+  │ 2ms    │ │ 3ms      │ │ 1ms   │ │ 10ms   │ │ Execute │ │ Total:  │
+  │        │ │          │ │       │ │(cached)│ │ 34ms    │ │ ~50ms   │
+  └────────┘ └──────────┘ └───────┘ └────────┘ └─────────┘ └─────────┘
+
+With TinyJit (after first call):
+  ┌─────────┐ ┌─────────┐
+  │ Replay  │→│ Total:  │    All scheduling/compilation skipped
+  │ Execute │ │ ~34ms   │
+  │ 34ms    │ │         │
+  └─────────┘ └─────────┘
+```
+
+**Caveat**: TinyJit assumes fixed shapes. For LLM decode this is perfect (always batch=1, seq_len=1). For prefill with variable prompt lengths, each new prompt length triggers a fresh JIT capture.
+
+### The GGUF Loading Pipeline: How Models Get Into tinygrad
+
+GGUF (GPT-Generated Unified Format) is the model file format used by llama.cpp. It stores weights in quantized blocks. Here's what happens when tinygrad loads one:
+
+```
+GGUF file on disk:
+  ┌──────────┐
+  │ Header   │  magic, version, tensor count, metadata
+  ├──────────┤
+  │ Metadata │  architecture, context length, vocab, rope settings
+  ├──────────┤
+  │ Tensor   │  name="blk.0.attn_q.weight", type=Q6_K, shape=[2048,2048]
+  │ Tensor   │  name="blk.0.attn_k.weight", type=Q6_K, shape=[512,2048]
+  │ ...      │  (hundreds of tensors)
+  └──────────┘
+
+tinygrad loading pipeline:
+  1. Parse GGUF header → extract tensor metadata (names, shapes, types, offsets)
+  2. For each tensor:
+     a. Read raw quantized bytes from GGUF file
+     b. Call ggml_data_to_tensor() → dequantize to float32 Tensor
+     c. If HALF=1 (default): cast to fp16     ← this is the "dequant tax"
+     d. Assign to model attribute (e.g., model.layers[0].attention.wq)
+  3. Model is ready — all weights are fp16 Tensors backed by GPU buffers
+```
+
+```
+Memory timeline:
+  Disk:   Q6_K file  (0.97 GB for LLaMA 1B)
+    │
+    ▼  ggml_data_to_tensor()
+  CPU:    fp32 tensors (4.96 GB) ← temporary, 5× the file size!
+    │
+    ▼  .half() cast
+  GPU:    fp16 tensors (2.48 GB) ← final, stays here for all inference
+    │
+    ▼  (CPU fp32 tensors freed)
+
+  Peak memory: ~7.4 GB (Q6_K + fp32 + fp16 briefly overlap)
+  Steady-state: 2.48 GB (just the fp16 weights on GPU)
+```
+
+**Why not dequantize directly to fp16?** tinygrad's GGUF parser is generic — `ggml_data_to_tensor()` produces fp32 tensors for maximum precision, then the model casts to fp16. A fused Q6_K→fp16 path would cut peak memory by ~5 GB, but it's a micro-optimization that hasn't been prioritized since steady-state memory is fine on the 64 GB Orin.
+
+**Why not keep weights quantized and dequant per-token (like llama.cpp)?** This would require custom CUDA kernels for each quantization type fused with matrix multiply. tinygrad's compiler generates generic PTX — it knows "multiply fp16 matrices" but doesn't know "dequantize Q6_K block and multiply in one kernel". Adding fused dequant kernels would require either pattern matching rules or custom ops. This is the main avenue for tinygrad to close the gap with MLC LLM (see Part 4).
+
+### Profiling: PROFILE=1 and How to Read Chrome Traces
+
+When you need to know *which* kernel is slow:
+
+```bash
+# Generate a profile trace
+NV=1 MV_THREADS_PER_ROW=32 PROFILE=1 python3 -m tinygrad.apps.llm \
+  --model llama3.2:1b --benchmark 5
+
+# This creates: /tmp/tinygrad_profile.json
+# Open in Chrome: chrome://tracing → Load → select the file
+```
+
+```
+What you see in the Chrome trace:
+  ┌────────────────────────────────────────────────────────┐
+  │ Timeline (horizontal = time)                           │
+  │                                                        │
+  │ GPU  ▎█████▎████▎████████████▎██▎████▎                │
+  │       0.3ms 0.2ms   1.1ms    0.1 0.4ms                │
+  │       norm  Q_proj  FFN_up   attn FFN_dn               │
+  │                                                        │
+  │ Copy ▎▎▎▎▎                                             │
+  │       Tiny bars = HCQ signal waits                     │
+  └────────────────────────────────────────────────────────┘
+
+What to look for:
+  1. Widest bars → biggest kernels → where time is spent
+  2. Gaps between bars → dispatch overhead or synchronization
+  3. If FFN kernels dominate → matvec optimization matters most
+  4. If attention kernels grow with sequence length → KV cache issue
+```
+
+### Common Errors and What They Mean
+
+```
+"CUDA_ERROR_NO_DEVICE" or "nvgpu not found"
+  → NV=1 set but /dev/nvhost-gpu doesn't exist
+  → Fix: ensure JetPack/L4T kernel is running, check `ls /dev/nvhost-*`
+
+"GPU fault at address 0x..."
+  → Kernel accessed invalid GPU memory (usually a compiler bug)
+  → Debug: run with DEBUG=4 to see which kernel, NOOPT=1 to bypass optimization
+
+"ptxas fatal: Unresolved extern function..."
+  → Missing CUDA include path
+  → Fix: export CUDA_INCLUDE_PATH=/path/to/cuda/include
+
+Out of memory during model load
+  → Peak memory during GGUF dequant → fp16 cast
+  → Fix: use a smaller quantization or smaller model
+
+Kernel produces NaN/incorrect results
+  → Usually a reduction bug or overflow in fp16
+  → Debug: HALF=0 (use fp32), DEBUG=4 (print kernels), compare against CPU
+
+"ioctl failed: EINVAL" on Jetson
+  → VA space collision or memory mapping failure
+  → Usually transient: restart Python and try again
+```
+
+---
+
 ## Summary
 
 ### Why tinygrad wins vs llama.cpp
@@ -1044,4 +1746,4 @@ The first 3-4 lines are JIT warmup (slow). Steady-state is lines 5+.
 
 ---
 
-**Previous**: [← Pill 14: Contributing to TinyGrad](14-contributing.md)
+**Previous**: [← Pill 14: Contributing to TinyGrad](14-contributing.md) | **Next**: [Pill 16: Jetson DevKit Practical Guide →](16-jetson-devkit-guide.md)
