@@ -130,7 +130,9 @@ def beam_search(s:Scheduler, rawbufs:list[Buffer], amt:int, allow_test_size=True
 
   default_parallel = multiprocessing.cpu_count() if s.ren.device in {"CUDA", "AMD", "NV", "METAL", "HIP"} else 0
   if beam_pool is None and (workers := getenv("PARALLEL", default_parallel)):
-    beam_pool = multiprocessing.get_context("spawn").Pool(workers, _init_worker, (), getenv("BEAM_MAX_TASKS_PER_CHILD", 16))
+    import sys
+    _mp_ctx = "fork" if sys.platform == "linux" else "spawn"
+    beam_pool = multiprocessing.get_context(_mp_ctx).Pool(workers, _init_worker, (), getenv("BEAM_MAX_TASKS_PER_CHILD", 16))
     @atexit.register
     def close_pool(): beam_pool.close()
 
