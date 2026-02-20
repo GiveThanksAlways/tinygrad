@@ -5,11 +5,11 @@
 We benchmarked four LLM inference frameworks on the Jetson AGX Orin 64GB.
 Here's what happened:
 
-| Model | tinygrad NV=1 | llama.cpp +FA | vLLM fp16 | MLC LLM fp16 |
-|-------|:---:|:---:|:---:|:---:|
-| Qwen3 0.6B | **41.0 tok/s** | 43.0 | ❌ | ❌ |
-| LLaMA 1B | **29.0** | 27.85 | 30.1 | **36.8** |
-| LLaMA 3B | **12.1** | 11.86 | — | — |
+| Model      | tinygrad NV=1  | llama.cpp +FA | vLLM fp16 | MLC LLM fp16 |
+| ---------- | :------------: | :-----------: | :-------: | :----------: |
+| Qwen3 0.6B | **41.0 tok/s** |     43.0      |     ❌     |      ❌       |
+| LLaMA 1B   |    **29.0**    |     27.85     |   30.1    |   **36.8**   |
+| LLaMA 3B   |    **12.1**    |     11.86     |     —     |      —       |
 
 tinygrad beats llama.cpp on every model. It ties vLLM. But MLC LLM is 27% faster.
 
@@ -23,7 +23,7 @@ tinygrad beats llama.cpp on every model. It ties vLLM. But MLC LLM is 27% faster
 
 LLM inference has two phases:
 
-```
+```text
 Phase 1: PREFILL  (process the prompt)
   Input:  "Explain transformers in detail..."  →  42 tokens
   Shape:  weight[2048, 2048] × input[42, 2048] = output[42, 2048]
@@ -50,6 +50,7 @@ $$\text{theoretical max tok/s} = \frac{102 \text{ GB/s}}{2.48 \text{ GB}} \appro
 Every framework is racing to read model weights from DRAM as fast as possible. The math (multiply-add) takes almost zero time by comparison. This is called being **memory-bandwidth bound** — the bottleneck is memory reads, not compute.
 
 **Key insight**: The only ways to go faster are:
+
 1. Read fewer bytes (smaller quantization)
 2. Read bytes faster (better memory access patterns)
 3. Waste less time between reads (lower dispatch overhead)
@@ -76,6 +77,7 @@ $$y_i = \sum_{k=0}^{K-1} W_{i,k} \cdot x_k$$
 On GPU, you want many threads cooperating on each row so they can read $W$ in big coalesced bursts (128 bytes at a time). Without this cooperation, each thread reads its own row independently → terrible cache behavior → 5% of peak bandwidth.
 
 tinygrad's **matvec heuristic** ([Pill 11](11-matvec-heuristic.md)) sets up this cooperative pattern:
+
 - `MV_THREADS_PER_ROW=32` — 32 threads share a row, each reading K/32 elements
 - `MV_BLOCKSIZE=4` — 4 rows per workgroup
 - `MV_ROWS_PER_THREAD=4` — each thread handles 4 rows (vector loads)
@@ -107,18 +109,19 @@ q4f16_1:  4-bit MLC format       → ~0.56 bytes/param (3.6× compression)
 
 Fewer bytes = fewer DRAM reads = faster. But there's a cost: the GPU must **dequantize** each block before it can multiply. Different frameworks handle this differently:
 
-| Framework | How it dequantizes | When | Memory footprint |
-|-----------|-------------------|------|:----------------:|
-| **llama.cpp** | Custom CUDA kernels, fused with matmul | Per-token (on-the-fly) | Native quant size |
-| **tinygrad** | `ggml_data_to_tensor()` → cast to fp16 | At load time (once) | **2× native size** |
-| **MLC LLM** | TVM-compiled kernels, fused with matmul | Per-token (on-the-fly) | Custom format |
-| **vLLM** | PyTorch CUDA kernels | Per-token (on-the-fly) | Native or fp16 |
+| Framework     | How it dequantizes                      | When                   |  Memory footprint  |
+| ------------- | --------------------------------------- | ---------------------- | :----------------: |
+| **llama.cpp** | Custom CUDA kernels, fused with matmul  | Per-token (on-the-fly) | Native quant size  |
+| **tinygrad**  | `ggml_data_to_tensor()` → cast to fp16  | At load time (once)    | **2× native size** |
+| **MLC LLM**   | TVM-compiled kernels, fused with matmul | Per-token (on-the-fly) |   Custom format    |
+| **vLLM**      | PyTorch CUDA kernels                    | Per-token (on-the-fly) |   Native or fp16   |
 
 **This is tinygrad's hidden tax**: loading a Q6_K model (0.97 GB) into tinygrad results in ~3.0 GB of fp16 weights in memory. Each token reads 3.0 GB instead of 0.97 GB. Yet tinygrad still wins.
 
 ### What is Kernel Dispatch Overhead?
 
 Every time the GPU runs a small computation (a "kernel"), the CPU must:
+
 1. Set up parameters (thread counts, memory pointers)
 2. Submit the command to the GPU
 3. Wait for the GPU to start executing
@@ -150,10 +153,10 @@ The NV backend ([Pill 9](09-jetson-nv-backend-pt1.md), [Pill 10](10-jetson-nv-ba
 
 **Result**: 24% faster than CUDA=1 (cuBLAS) on the same tinygrad code.
 
-| Backend | Qwen3 0.6B tok/s | Bandwidth utilized |
-|---------|:---:|:---:|
-| **NV=1** (direct ioctl) | **41.0** | 198 GB/s (97% of peak) |
-| CUDA=1 (cuBLAS) | 33.2 | 159 GB/s (78% of peak) |
+| Backend                 | Qwen3 0.6B tok/s |   Bandwidth utilized   |
+| ----------------------- | :--------------: | :--------------------: |
+| **NV=1** (direct ioctl) |     **41.0**     | 198 GB/s (97% of peak) |
+| CUDA=1 (cuBLAS)         |       33.2       | 159 GB/s (78% of peak) |
 
 ### What is TVM Compilation? (Why MLC LLM is Fast)
 
@@ -177,6 +180,7 @@ At runtime:
 ```
 
 Key advantages of TVM/MLC:
+
 - **CUTLASS kernels**: NVIDIA's hand-tuned matrix multiply templates, optimized per-GPU-architecture
 - **Operator fusion**: Multiple operations merged into single kernels (less dispatch overhead)
 - **CUDA Graphs**: Entire token generation recorded as one graph, replayed without CPU involvement
@@ -194,11 +198,11 @@ tinygrad has two ways to optimize its generated kernels:
 
 On Jetson Orin, BEAM is **counterproductive** for LLM decode:
 
-| Config | tok/s | Why |
-|--------|:---:|-----|
-| Default heuristic | **29.0** | Well-tuned rules for Orin's memory system |
-| JITBEAM=2 | 1.0 | 27× slower! Beam finds locally-optimal kernels that cause cache thrashing |
-| JITBEAM=4 | 1.1 | Same disaster |
+| Config            |  tok/s   | Why                                                                       |
+| ----------------- | :------: | ------------------------------------------------------------------------- |
+| Default heuristic | **29.0** | Well-tuned rules for Orin's memory system                                 |
+| JITBEAM=2         |   1.0    | 27× slower! Beam finds locally-optimal kernels that cause cache thrashing |
+| JITBEAM=4         |   1.1    | Same disaster                                                             |
 
 **Root cause**: BEAM optimizes each kernel independently. It finds thread/block configs that minimize single-kernel time. But on Orin's unified memory (shared LPDDR5, no dedicated VRAM), these "optimal" configs cause inter-kernel cache thrashing that destroys overall pipeline throughput.
 
@@ -212,12 +216,12 @@ See [Pill 7](07-beam-search.md) for the full BEAM deep-dive.
 
 tinygrad beats llama.cpp by 4-13% across all models tested:
 
-| Model (quant) | tinygrad NV=1 | llama.cpp +FA | tinygrad advantage | tinygrad reads more data? |
-|---------------|:---:|:---:|:---:|:---:|
-| Qwen3 0.6B (Q8_0) | 41.0 | 37.1 (no FA) | **+10%** | +87% (1.14 vs 0.61 GB) |
-| Qwen3 0.6B (Q8_0) | 41.0 | 43.0 (+FA) | −5% | +87% |
-| LLaMA 1B (Q6_K) | 29.0 | 27.85 | **+4%** | +209% (3.0 vs 0.97 GB) |
-| LLaMA 3B (Q6_K) | 12.1 | 11.86 | **+2%** | +194% (7.2 vs 2.45 GB) |
+| Model (quant)     | tinygrad NV=1 | llama.cpp +FA | tinygrad advantage | tinygrad reads more data? |
+| ----------------- | :-----------: | :-----------: | :----------------: | :-----------------------: |
+| Qwen3 0.6B (Q8_0) |     41.0      | 37.1 (no FA)  |      **+10%**      |  +87% (1.14 vs 0.61 GB)   |
+| Qwen3 0.6B (Q8_0) |     41.0      |  43.0 (+FA)   |        −5%         |           +87%            |
+| LLaMA 1B (Q6_K)   |     29.0      |     27.85     |      **+4%**       |  +209% (3.0 vs 0.97 GB)   |
+| LLaMA 3B (Q6_K)   |     12.1      |     11.86     |      **+2%**       |  +194% (7.2 vs 2.45 GB)   |
 
 ### The Paradox: tinygrad reads MORE data but is FASTER
 
@@ -244,6 +248,7 @@ tinygrad NV=1 per token:
 ```
 
 **Key numbers**:
+
 - llama.cpp processes fewer bytes per kernel (native quant) but has 10-15 µs CUDA dispatch overhead per kernel launch
 - tinygrad processes more bytes per kernel (fp16 dequant) but has ~0.5 µs NV dispatch overhead
 - At 40 kernels/token, llama.cpp wastes ~0.4-0.6 ms on dispatch; tinygrad wastes ~0.02 ms
@@ -251,19 +256,20 @@ tinygrad NV=1 per token:
 
 ### Why NV Dispatch is 20× Faster Than CUDA
 
-|  | CUDA Runtime | tinygrad NV |
-|--|-------------|-------------|
-| **API call** | `cuLaunchKernel()` | Write QMD to mapped memory |
-| **Driver involvement** | Full round-trip through kernel driver | Zero — purely userspace |
-| **Synchronization** | Implicit barriers per launch | Timeline signals, async |
-| **Memory** | Driver copies command buffers | Direct MMIO to GPU FIFO |
-| **Overhead** | ~5-15 µs per launch | ~0.5 µs per launch |
+|                        | CUDA Runtime                          | tinygrad NV                |
+| ---------------------- | ------------------------------------- | -------------------------- |
+| **API call**           | `cuLaunchKernel()`                    | Write QMD to mapped memory |
+| **Driver involvement** | Full round-trip through kernel driver | Zero — purely userspace    |
+| **Synchronization**    | Implicit barriers per launch          | Timeline signals, async    |
+| **Memory**             | Driver copies command buffers         | Direct MMIO to GPU FIFO    |
+| **Overhead**           | ~5-15 µs per launch                   | ~0.5 µs per launch         |
 
 The NV backend (HCQ) writes a "Queue Meta Descriptor" (QMD) — a small struct with thread counts, memory pointers, and the kernel binary address — directly into GPU-visible memory, then pokes the GPU's doorbell register. No syscalls, no driver copies, no implicit synchronization.
 
 ### What is Flash Attention (+FA)?
 
 Flash Attention is an optimized attention computation that:
+
 1. Fuses the Q×K, softmax, and ×V operations into one kernel
 2. Uses tiling to keep intermediate values in GPU shared memory (not DRAM)
 3. Reduces memory reads by ~4× for the attention portion
@@ -293,11 +299,11 @@ tinygrad wins even against +FA because NV dispatch savings exceed FA's attention
 
 ## Part 3: Why tinygrad Ties/Beats vLLM
 
-| Workload | tinygrad | vLLM | Winner |
-|----------|:---:|:---:|--------|
-| LLaMA 1B fp16 (direct benchmark) | 29.0 | 30.1 (API) | **Tie** |
-| LLaMA 1B Q6_K | ~29 | ~15 | **tinygrad 2×** |
-| Qwen3 (any) | 41.0 | ❌ | **tinygrad** (only one that works) |
+| Workload                         | tinygrad |    vLLM    | Winner                             |
+| -------------------------------- | :------: | :--------: | ---------------------------------- |
+| LLaMA 1B fp16 (direct benchmark) |   29.0   | 30.1 (API) | **Tie**                            |
+| LLaMA 1B Q6_K                    |   ~29    |    ~15     | **tinygrad 2×**                    |
+| Qwen3 (any)                      |   41.0   |     ❌      | **tinygrad** (only one that works) |
 
 ### vLLM's Architecture
 
@@ -418,11 +424,11 @@ Fewer kernels = fewer DRAM round-trips = less time waiting for memory. Even with
 
 The 27% gap breaks down roughly as:
 
-| Advantage | Estimated impact | Could tinygrad fix it? |
-|-----------|:---:|-----|
-| CUTLASS kernels (better bandwidth util) | ~10% | Partially — better PTX generation, but hard to match hand-tuned ASM |
-| CUDA Graphs (less dispatch) | ~2% | NV backend already very low dispatch; diminishing returns |
-| Operator fusion (fewer kernels) | ~15% | Yes — tinygrad's compiler can learn to fuse more aggressively |
+| Advantage                               | Estimated impact | Could tinygrad fix it?                                              |
+| --------------------------------------- | :--------------: | ------------------------------------------------------------------- |
+| CUTLASS kernels (better bandwidth util) |       ~10%       | Partially — better PTX generation, but hard to match hand-tuned ASM |
+| CUDA Graphs (less dispatch)             |       ~2%        | NV backend already very low dispatch; diminishing returns           |
+| Operator fusion (fewer kernels)         |       ~15%       | Yes — tinygrad's compiler can learn to fuse more aggressively       |
 
 The biggest opportunity is **operator fusion**. tinygrad's pattern matcher ([Pill 8](08-pattern-matching.md)) could learn to fuse norm+projection and RoPE+attention, eliminating DRAM round-trips. This is an active area of development.
 
@@ -432,14 +438,14 @@ The biggest opportunity is **operator fusion**. tinygrad's pattern matcher ([Pil
 
 ### Why Different Models Favor Different Frameworks
 
-| Factor | Small models favor | Large models favor |
-|--------|-------------------|-------------------|
-| Dispatch overhead | tinygrad (NV zero-overhead) | MLC (CUDA Graphs) |
-| Kernel quality | MLC (CUTLASS) | MLC (CUTLASS) |
-| Memory efficiency | llama.cpp (native quant) | llama.cpp (native quant) |
-| Model support | tinygrad (GGUF generic) | vLLM (HuggingFace ecosystem) |
-| Startup time | llama.cpp (~instant) | vLLM (~1 min) |
-| Batch throughput | vLLM (PagedAttention) | vLLM (PagedAttention) |
+| Factor            | Small models favor          | Large models favor           |
+| ----------------- | --------------------------- | ---------------------------- |
+| Dispatch overhead | tinygrad (NV zero-overhead) | MLC (CUDA Graphs)            |
+| Kernel quality    | MLC (CUTLASS)               | MLC (CUTLASS)                |
+| Memory efficiency | llama.cpp (native quant)    | llama.cpp (native quant)     |
+| Model support     | tinygrad (GGUF generic)     | vLLM (HuggingFace ecosystem) |
+| Startup time      | llama.cpp (~instant)        | vLLM (~1 min)                |
+| Batch throughput  | vLLM (PagedAttention)       | vLLM (PagedAttention)        |
 
 ### The Bandwidth Race (tok/s = bandwidth / model_size)
 
@@ -469,15 +475,15 @@ tinygrad avoids this by dequantizing once at load time. Its kernels are pure fp1
 
 ### Decision Matrix: When to Use Each Framework
 
-| Your situation | Best framework | Why |
-|---------------|---------------|-----|
-| Single user, latest models (Qwen3, etc.) | **tinygrad NV=1** | Only one that supports them |
-| Single user, LLaMA/Mistral, max tok/s | **MLC LLM** | CUTLASS + CUDA Graphs |
-| Single user, minimal dependencies | **llama.cpp** | C++ binary, no Python/Docker |
-| Many concurrent users | **vLLM** | PagedAttention, continuous batching |
-| Smallest memory footprint | **llama.cpp** | Native quantized format |
-| Hackable, want to modify the inference engine | **tinygrad** | 10K lines of Python, all visible |
-| Embedded/edge deployment | **tinygrad NV=1** or **llama.cpp** | No Docker, low overhead |
+| Your situation                                | Best framework                     | Why                                 |
+| --------------------------------------------- | ---------------------------------- | ----------------------------------- |
+| Single user, latest models (Qwen3, etc.)      | **tinygrad NV=1**                  | Only one that supports them         |
+| Single user, LLaMA/Mistral, max tok/s         | **MLC LLM**                        | CUTLASS + CUDA Graphs               |
+| Single user, minimal dependencies             | **llama.cpp**                      | C++ binary, no Python/Docker        |
+| Many concurrent users                         | **vLLM**                           | PagedAttention, continuous batching |
+| Smallest memory footprint                     | **llama.cpp**                      | Native quantized format             |
+| Hackable, want to modify the inference engine | **tinygrad**                       | 10K lines of Python, all visible    |
+| Embedded/edge deployment                      | **tinygrad NV=1** or **llama.cpp** | No Docker, low overhead             |
 
 ---
 
@@ -501,12 +507,12 @@ export HALF=1
 
 ### The Impact of Each Tuning Knob
 
-| Setting | Off → On | Impact | Why |
-|---------|----------|:---:|-----|
-| NV=1 (vs CUDA=1) | 33.2 → 41.0 | **+24%** | Zero-overhead dispatch vs CUDA runtime |
-| MV_THREADS_PER_ROW=32 | 18.3 → 29.0 | **+59%** | Enables cooperative matvec kernels |
-| HALF=1 (vs HALF=0) | 24.2 → 41.0 | **+70%** | fp16 = half the DRAM reads |
-| JITBEAM=2 | 29.0 → 1.0 | **−97%** | Cache thrashing on unified memory |
+| Setting               | Off → On    |  Impact  | Why                                    |
+| --------------------- | ----------- | :------: | -------------------------------------- |
+| NV=1 (vs CUDA=1)      | 33.2 → 41.0 | **+24%** | Zero-overhead dispatch vs CUDA runtime |
+| MV_THREADS_PER_ROW=32 | 18.3 → 29.0 | **+59%** | Enables cooperative matvec kernels     |
+| HALF=1 (vs HALF=0)    | 24.2 → 41.0 | **+70%** | fp16 = half the DRAM reads             |
+| JITBEAM=2             | 29.0 → 1.0  | **−97%** | Cache thrashing on unified memory      |
 
 ### Running the Benchmark
 
@@ -541,23 +547,27 @@ The first 3-4 lines are JIT warmup (slow). Steady-state is lines 5+.
 
 ## Summary
 
-### Why tinygrad wins vs llama.cpp:
+### Why tinygrad wins vs llama.cpp
+
 - **NV backend's zero-overhead dispatch** saves 0.4-0.6 ms per token
 - This **more than compensates** for reading 2-3× more data (dequant→fp16 at load)
 - Wins by 4-13% across all models tested
 
-### Why tinygrad ties vLLM:
+### Why tinygrad ties vLLM
+
 - vLLM's CUDA Runtime dispatch overhead cancels out its better kernel library
 - vLLM's GGUF path is poorly optimized (2× slower on quantized models)
 - tinygrad supports newer model architectures (Qwen3)
 
-### Why MLC LLM beats tinygrad:
+### Why MLC LLM beats tinygrad
+
 - **CUTLASS kernels** (NVIDIA hand-tuned) get ~10% more bandwidth utilization
 - **CUDA Graphs** eliminate dispatch overhead entirely
 - **TVM operator fusion** reduces DRAM round-trips by merging kernels
 - Total advantage: ~27%
 
-### The fundamental tradeoff:
+### The fundamental tradeoff
+
 - **tinygrad**: General-purpose compiler, ~85-97% bandwidth utilization, zero-overhead NV dispatch, works on any GGUF model
 - **MLC LLM**: Specialized compiler, ~89-95% utilization, CUDA Graphs, only works on pre-compiled models
 - **llama.cpp**: Custom C++ kernels, ~26% bandwidth utilization (compute-bound on dequant), widest model support
