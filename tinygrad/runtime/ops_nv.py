@@ -340,6 +340,27 @@ class NVAllocator(HCQAllocator['NVDevice']):
 
   def _do_free(self, opaque:HCQBuffer, options:BufferSpec): self.dev.iface.free(opaque)
 
+  def _copyout(self, dest:memoryview, src:HCQBuffer):
+    # On Tegra, GPU buffers are in unified system RAM and CPU-mapped with INNER_CACHEABLE.
+    # Direct memmove is faster than the default HCQ DMA staging path (which copies through
+    # a 2MB write-combine staging buffer in chunks, incurring 2× data movement + per-chunk
+    # submission overhead + uncached staging reads). After synchronize(), GPU writes are
+    # visible to CPU via IO-coherent SMMU, so direct read is safe.
+    if self.dev.is_tegra():
+      self.dev.synchronize()
+      ctypes.memmove(mv_address(dest), src.va_addr, len(dest))
+      return
+    super()._copyout(dest, src)
+
+  def _copyin(self, dest:HCQBuffer, src:memoryview):
+    # Same optimization for host→device: on Tegra unified memory, direct memmove
+    # into the GPU-mapped buffer is faster than DMA staging through write-combine buffers.
+    if self.dev.is_tegra():
+      self.dev.synchronize()
+      ctypes.memmove(dest.va_addr, mv_address(src), len(src))
+      return
+    super()._copyin(dest, src)
+
   def _map(self, buf:HCQBuffer): return self.dev.iface.map(buf._base if buf._base is not None else buf)
 
   def _encode_decode(self, bufout:HCQBuffer, bufin:HCQBuffer, desc_buf:HCQBuffer, hist:list[HCQBuffer], shape:tuple[int,...], frame_pos:int):
