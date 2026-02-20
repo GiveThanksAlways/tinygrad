@@ -80,12 +80,12 @@ Stack multiple dot products = matvec. This is what happens **every time the LLM 
 
 ```text
   Weight matrix W (3×4):          Input vector x (4×1):
-  ┌                    ┐          ┌     ┐
-  │  0.5  -1.0  2.0  0.3 │       │  1.0 │
-  │ -0.2   1.5  0.0  0.8 │   ×   │ -2.0 │
-  │  1.0   0.5 -1.0  0.4 │       │  0.5 │
-  └                    ┘          │  3.0 │
-                                  └     ┘
+  ┌                      ┐        ┌      ┐
+  │  0.5  -1.0  2.0  0.3 │        │  1.0 │
+  │ -0.2   1.5  0.0  0.8 │   ×    │ -2.0 │
+  │  1.0   0.5 -1.0  0.4 │        │  0.5 │
+  └                      ┘        │  3.0 │
+                                  └      ┘
 
   Row 0:  (0.5×1.0) + (-1.0×-2.0) + (2.0×0.5) + (0.3×3.0)
         =    0.5    +     2.0     +    1.0    +    0.9
@@ -120,9 +120,9 @@ During prefill (processing your prompt), we don't have one vector — we have ma
 ```
   Weight W (3×4):                 Input X (4×2):    ← 2 tokens
   ┌                    ┐          ┌           ┐
-  │  1   0  -1   2    │          │  1    0   │
-  │  0   1   1  -1    │    ×     │  2   -1   │
-  │  2  -1   0   1    │          │  0    3   │
+  │  1   0  -1   2     │          │  1    0   │
+  │  0   1   1  -1     │    ×     │  2   -1   │
+  │  2  -1   0   1     │          │  0    3   │
   └                    ┘          │ -1    1   │
                                   └           ┘
 
@@ -147,7 +147,7 @@ During prefill (processing your prompt), we don't have one vector — we have ma
 
 A transformer is a stack of identical layers. Each layer has two parts:
 
-```
+```text
 Input token embedding (vector of d numbers, e.g., d=2048)
   │
   ▼
@@ -155,17 +155,17 @@ Input token embedding (vector of d numbers, e.g., d=2048)
 │  ATTENTION BLOCK                            │
 │  "Which previous tokens should I look at?"  │
 │                                             │ ─── repeated N times
-│  Q = x × W_q    (query: "what am I?")      │     (N=16 for LLaMA 1B)
-│  K = x × W_k    (key: "what do I offer?")  │
-│  V = x × W_v    (value: "here's my info")  │
-│  attn = softmax(Q × K^T / √d) × V         │
-│  out = attn × W_o                          │
+│  Q = x × W_q    (query: "what am I?")       │     (N=16 for LLaMA 1B)
+│  K = x × W_k    (key: "what do I offer?")   │
+│  V = x × W_v    (value: "here's my info")   │
+│  attn = softmax(Q × K^T / √d) × V           │
+│  out = attn × W_o                           │
 ├─────────────────────────────────────────────┤
 │  FEED-FORWARD BLOCK (FFN)                   │
 │  "Process what attention found"             │
 │                                             │
-│  up   = x × W_up      (expand: d → 4d)     │
-│  gate = x × W_gate    (gating: d → 4d)     │
+│  up   = x × W_up      (expand: d → 4d)      │
+│  gate = x × W_gate    (gating: d → 4d)      │
 │  down = SiLU(gate) ⊙ up × W_down  (4d → d) │
 └─────────────────────────────────────────────┘
   │
@@ -200,29 +200,29 @@ Let's work through self-attention with tiny dimensions. Imagine `d=4`, `seq_len=
 
 **Step 1: We have 3 token embeddings (rows of X)**
 
-```
+```text
   X (3×4):   ← 3 tokens, each a 4-dimensional vector
-  ┌                     ┐
+  ┌                       ┐
   │  1.0   0.0  -1.0  2.0 │   ← token 0: "The"
   │  0.5   1.0   0.5  0.0 │   ← token 1: "cat"
   │ -1.0   2.0   1.0  1.0 │   ← token 2: "sat"  (current token)
-  └                     ┘
+  └                       ┘
 ```
 
 **Step 2: Project to Q, K, V** (each is X × W_something, but let's just use the results)
 
-```
+```text
   Q (3×4):                K (3×4):                V (3×4):
-  ┌              ┐        ┌              ┐        ┌              ┐
+  ┌               ┐      ┌               ┐      ┌                ┐
   │  1   0  -1  0 │      │  0   1   0  1 │      │  2   1   0   0 │
   │  0   1   0  1 │      │  1  -1   1  0 │      │  0   0   1   1 │
   │  1   1   0 -1 │      │  0   0   1  1 │      │  1   1   1   0 │
-  └              ┘        └              ┘        └              ┘
+  └               ┘      └               ┘      └                ┘
 ```
 
 **Step 3: Compute attention scores `S = Q × K^T`** (each query asks "how relevant is each key?")
 
-```
+```text
   K^T (4×3):               S = Q × K^T (3×3):
   ┌           ┐
   │  0  1  0  │
@@ -247,7 +247,7 @@ Let's work through self-attention with tiny dimensions. Imagine `d=4`, `seq_len=
 
 **Step 4: Scale by $\frac{1}{\sqrt{d}}$ and apply softmax** (turn scores into probabilities)
 
-```
+```text
   Scale: 1/√4 = 0.5
 
   S_scaled = ┌                ┐
@@ -270,13 +270,13 @@ Let's work through self-attention with tiny dimensions. Imagine `d=4`, `seq_len=
 
 **Step 5: Weighted sum of Values `O = P × V`** (blend the values based on attention)
 
-```
+```text
   V (3×4):                        O = P × V (3×4):
-  ┌              ┐
-  │ 2  1  0  0  │
-  │ 0  0  1  1  │
-  │ 1  1  1  0  │
-
+  ┌            ┐
+  │ 2  1  0  0 │
+  │ 0  0  1  1 │
+  │ 1  1  1  0 │
+  └            ┘
   O[0] = 0.38×[2,1,0,0] + 0.38×[0,0,1,1] + 0.23×[1,1,1,0]
        = [0.76, 0.38, 0, 0] + [0, 0, 0.38, 0.38] + [0.23, 0.23, 0.23, 0]
        = [0.99, 0.61, 0.61, 0.38]
@@ -296,7 +296,7 @@ Let's work through self-attention with tiny dimensions. Imagine `d=4`, `seq_len=
 
 During decode (generating tokens one at a time), there's a critical optimization: **don't recompute K and V for past tokens**.
 
-```
+```text
 Without KV cache (naive — recompute everything):
   Token 0: compute Q₀,K₀,V₀  → attn(Q₀, [K₀], [V₀])            → 1 token
   Token 1: compute Q₁,K₁,V₁  → attn(Q₁, [K₀,K₁], [V₀,V₁])     → 2 tokens
@@ -402,10 +402,10 @@ Without this fix: **18.3 tok/s**. With it: **29.0 tok/s** (+59%).
 
 Every weight in a neural network is a floating-point number. The format determines **how many bytes the GPU must read per weight** — and therefore how fast you can run.
 
-```
+```text
 float32 (4 bytes — full precision):
 ┌───┬───────────────────┬───────────────────────────────────────────────────────┐
-│ S │ E E E E E E E E   │ M M M M M M M M M M M M M M M M M M M M M M M       │
+│ S │ E E E E E E E E   │ M M M M M M M M M M M M M M M M M M M M M M M         │
 │ 1 │     8 bits        │                    23 bits                            │
 └───┴───────────────────┴───────────────────────────────────────────────────────┘
  sign    exponent              mantissa (fraction)
@@ -415,7 +415,7 @@ float32 (4 bytes — full precision):
 float16 / fp16 (2 bytes — half precision):
 ┌───┬───────────┬───────────────────────┐
 │ S │ E E E E E │ M M M M M M M M M M   │
-│ 1 │  5 bits   │       10 bits          │
+│ 1 │  5 bits   │       10 bits         │
 └───┴───────────┴───────────────────────┘
  sign  exponent    mantissa
        (range)     (precision: ~3.3 decimal digits)
@@ -447,7 +447,7 @@ bfloat16 / bf16 (2 bytes — "brain" float, Google TPU format):
 
 **The DRAM bandwidth impact**:
 
-```
+```text
   1.24 billion weights × 4 bytes (fp32) = 4.96 GB per token read
   1.24 billion weights × 2 bytes (fp16) = 2.48 GB per token read  ← 2× less data!
 
@@ -464,7 +464,7 @@ Quantization compresses weights below 16 bits. The idea: store a **block** of we
 
 **Q8_0 by hand** (simplest quantization): block of 32 weights
 
-```
+```text
 Original fp16 weights (32 × 2 bytes = 64 bytes):
 ┌──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────┐
 │ 0.52 │-1.83 │ 0.91 │ 0.03 │-0.77 │ 1.24 │-0.45 │ 0.66 │ ... (×32)
@@ -553,7 +553,7 @@ Before we dive into GPU internals, let's understand the *specific* chip we're ru
 
 #### The Full SoC Block Diagram
 
-```
+```text
 ┌─────────────────────────────── Jetson AGX Orin 64GB ───────────────────────────────┐
 │                                                                                     │
 │  ┌─────────────────────────── Ampere GPU (cut-down) ───────────────────────────┐   │

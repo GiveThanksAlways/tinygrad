@@ -298,9 +298,14 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
   Converts ggml tensor data to a tinygrad tensor.
 
   Supported native types: float32 (id: 0), float16 (id: 1), int8 (id: 16), int16 (id: 17), int32 (id: 18)
-  Supported quantized types: Q4_0 (id: 2), Q4_1 (id: 3), Q8_0 (id: 8), Q4_K (id: 12), Q6_K (id: 14), MXFP4 (id: 39)
+  Supported quantized types: Q4_0 (id: 2), Q4_1 (id: 3), Q8_0 (id: 8), Q4_K (id: 12), Q6_K (id: 14), BF16 (id: 30), MXFP4 (id: 39)
   """
   # https://github.com/ggerganov/ggml/blob/323951f1bdcdfbd5b5ff3a9a7c3770e63b1a560e/include/ggml.h#L356
+
+  # BF16 (id: 30) — convert to float32 by shifting upper 16 bits
+  if ggml_type == 30:
+    raw = t[:2 * n].bitcast(dtypes.ushort)[:n]
+    return raw.cast(dtypes.uint).lshift(16).bitcast(dtypes.float32)
 
   # native types
   if (dtype := { 0: dtypes.float32, 1: dtypes.float16, 16: dtypes.int8, 17: dtypes.int16, 18: dtypes.int32 }.get(ggml_type)) is not None:
