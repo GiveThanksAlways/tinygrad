@@ -1,0 +1,10 @@
+# Attention-Residuals-Orin-Lab  —  requirements
+#
+# tinygrad is the core framework.  Install it from the repo root:
+#   pip install -e .
+#
+# The packages below are optional helpers for logging / data.
+tinygrad
+numpy
+tqdm
+matplotlib

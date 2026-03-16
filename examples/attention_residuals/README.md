@@ -39,7 +39,7 @@ pip install numpy tqdm matplotlib
 python -c "from tinygrad import Device; print(Device.DEFAULT)"
 # Should print  CUDA  or  NV
 
-# 4. Run the small experiment TODAY
+# 4. Run the small experiment TODAY (from the repo root directory)
 python examples/attention_residuals/03_Small_Model_Experiment.py
 
 # 5. Read the tutorials at your own pace

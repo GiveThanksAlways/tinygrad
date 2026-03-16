@@ -59,6 +59,7 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 ### Step 2: Load the Base Model in 4-bit
 
 ```python
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 bnb_config = BitsAndBytesConfig(
@@ -74,7 +75,7 @@ model = AutoModelForCausalLM.from_pretrained(
     model_name,
     quantization_config=bnb_config,
     device_map="auto",            # auto-place on available GPU
-    torch_dtype="float16",
+    torch_dtype=torch.float16,
 )
 ```
 
@@ -200,7 +201,7 @@ dataset = dataset.map(lambda x: {"text": format_prompt(x)})
 ### Step 7: Launch Training
 
 ```bash
-# On Jetson Orin
+# On Jetson Orin — save Steps 2–6 above into a script called e.g. train_attnres_llama.py
 CUDA_VISIBLE_DEVICES=0 python train_attnres_llama.py
 ```
 

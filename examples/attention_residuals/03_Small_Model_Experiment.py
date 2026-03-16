@@ -169,7 +169,8 @@ class AttnResBlock:
     attn = attn.transpose(1, 2).reshape(B, T, D)
     attn = self.o(attn)
     # NOTE: we do NOT add the residual here — the caller handles it
-    out = attn + self.ff((attn + x).layernorm().linear(*self.ln2))
+    h = (attn + x).layernorm().linear(*self.ln2)
+    out = attn + self.ff(h)
     return out
 
 class AttnResTransformer:
